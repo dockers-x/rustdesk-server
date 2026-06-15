@@ -1,0 +1,268 @@
+name: build-docker
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LATEST_TAG: latest
+  DOCKERHUB_IMAGE: ${{ vars.DOCKER_IMAGE || secrets.DOCKER_IMAGE || format('{0}/rustdesk-server-s6', secrets.DOCKERHUB_USERNAME) }}
+  DOCKERHUB_IMAGE_CLASSIC: ${{ vars.DOCKER_IMAGE_CLASSIC || secrets.DOCKER_IMAGE_CLASSIC || format('{0}/rustdesk-server', secrets.DOCKERHUB_USERNAME) }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}-s6
+  GHCR_IMAGE_CLASSIC: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-linux:
+    name: Build Linux binaries - ${{ matrix.job.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   target: "x86_64-unknown-linux-musl" }
+          - { name: "arm64v8", target: "aarch64-unknown-linux-musl" }
+          - { name: "armv7",   target: "armv7-unknown-linux-musleabihf" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.90"
+          targets: ${{ matrix.job.target }}
+          components: rustfmt
+
+      - name: Install cross
+        run: cargo install cross --version 0.2.5
+
+      - name: Build
+        run: cross build --release --all-features --target=${{ matrix.job.target }}
+
+      - name: Make binaries executable
+        run: chmod -v a+x target/${{ matrix.job.target }}/release/hbbr target/${{ matrix.job.target }}/release/hbbs target/${{ matrix.job.target }}/release/rustdesk-utils
+
+      - name: Publish binaries
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: |
+            target/${{ matrix.job.target }}/release/hbbr
+            target/${{ matrix.job.target }}/release/hbbs
+            target/${{ matrix.job.target }}/release/rustdesk-utils
+          if-no-files-found: error
+
+  docker-s6:
+    name: Docker s6 - ${{ matrix.job.name }}
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   docker_platform: "linux/amd64",  s6_platform: "x86_64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64",  s6_platform: "aarch64" }
+          - { name: "armv7",   docker_platform: "linux/arm/v7", s6_platform: "armhf" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          submodules: recursive
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: docker/rootfs/usr/bin
+
+      - name: Make binaries executable
+        run: chmod -v a+x docker/rootfs/usr/bin/*
+
+      - name: Set release tags
+        run: |
+          T="${GITHUB_REF_NAME}"
+          M="${T%%.*}"
+          echo "GIT_TAG=$T" >> "$GITHUB_ENV"
+          echo "MAJOR_TAG=$M" >> "$GITHUB_ENV"
+
+      - name: Validate Docker Hub images
+        run: |
+          test -n "${DOCKERHUB_IMAGE}" || { echo "DOCKERHUB_IMAGE is empty"; exit 1; }
+          test -n "${DOCKERHUB_IMAGE_CLASSIC}" || { echo "DOCKERHUB_IMAGE_CLASSIC is empty"; exit 1; }
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: "./docker"
+          platforms: ${{ matrix.job.docker_platform }}
+          push: true
+          provenance: false
+          build-args: |
+            S6_ARCH=${{ matrix.job.s6_platform }}
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+
+  docker-classic:
+    name: Docker classic - ${{ matrix.job.name }}
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   docker_platform: "linux/amd64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64" }
+          - { name: "armv7",   docker_platform: "linux/arm/v7" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          submodules: recursive
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: docker-classic
+
+      - name: Make binaries executable
+        run: chmod -v a+x docker-classic/*
+
+      - name: Set release tags
+        run: |
+          T="${GITHUB_REF_NAME}"
+          M="${T%%.*}"
+          echo "GIT_TAG=$T" >> "$GITHUB_ENV"
+          echo "MAJOR_TAG=$M" >> "$GITHUB_ENV"
+
+      - name: Validate Docker Hub images
+        run: |
+          test -n "${DOCKERHUB_IMAGE}" || { echo "DOCKERHUB_IMAGE is empty"; exit 1; }
+          test -n "${DOCKERHUB_IMAGE_CLASSIC}" || { echo "DOCKERHUB_IMAGE_CLASSIC is empty"; exit 1; }
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: "./docker-classic"
+          platforms: ${{ matrix.job.docker_platform }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.DOCKERHUB_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.DOCKERHUB_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+
+  docker-manifest:
+    name: Docker manifests
+    needs:
+      - docker-s6
+      - docker-classic
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Set release tags
+        run: |
+          T="${GITHUB_REF_NAME}"
+          M="${T%%.*}"
+          echo "GIT_TAG=$T" >> "$GITHUB_ENV"
+          echo "MAJOR_TAG=$M" >> "$GITHUB_ENV"
+
+      - name: Validate Docker Hub images
+        run: |
+          test -n "${DOCKERHUB_IMAGE}" || { echo "DOCKERHUB_IMAGE is empty"; exit 1; }
+          test -n "${DOCKERHUB_IMAGE_CLASSIC}" || { echo "DOCKERHUB_IMAGE_CLASSIC is empty"; exit 1; }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifests
+        run: |
+          create_manifest() {
+            image="$1"
+            tag="$2"
+            docker buildx imagetools create \
+              -t "${image}:${tag}" \
+              "${image}:${tag}-amd64" \
+              "${image}:${tag}-arm64v8" \
+              "${image}:${tag}-armv7"
+          }
+
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE" "$DOCKERHUB_IMAGE_CLASSIC" "$GHCR_IMAGE_CLASSIC"; do
+            create_manifest "$image" "$GIT_TAG"
+            create_manifest "$image" "$MAJOR_TAG"
+            create_manifest "$image" "$LATEST_TAG"
+          done
