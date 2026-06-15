@@ -44,7 +44,7 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: "1.90"
           override: true
           default: true
           components: rustfmt
