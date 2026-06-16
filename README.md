@@ -206,19 +206,15 @@ services:
 | --------- | ------- | -------------------------------------------- |
 | multiarch | latest  | `czyt/rustdesk-server-s6:latest`         |
 | amd64     | latest  | `czyt/rustdesk-server-s6:latest-amd64`   |
-| i386      | latest  | `czyt/rustdesk-server-s6:latest-i386`    |
 | arm64v8   | latest  | `czyt/rustdesk-server-s6:latest-arm64v8` |
-| armv7     | latest  | `czyt/rustdesk-server-s6:latest-armv7`   |
-| multiarch | 2       | `czyt/rustdesk-server-s6:2`              |
-| amd64     | 2       | `czyt/rustdesk-server-s6:2-amd64`        |
-| i386      | 2       | `czyt/rustdesk-server-s6:2-i386`         |
-| arm64v8   | 2       | `czyt/rustdesk-server-s6:2-arm64v8`      |
-| armv7     | 2       | `czyt/rustdesk-server-s6:2-armv7`        |
-| multiarch | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0`          |
-| amd64     | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-amd64`    |
-| i386      | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-i386`     |
-| arm64v8   | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-arm64v8`  |
-| armv7     | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-armv7`    |
+| multiarch | v0      | `czyt/rustdesk-server-s6:v0`             |
+| amd64     | v0      | `czyt/rustdesk-server-s6:v0-amd64`       |
+| arm64v8   | v0      | `czyt/rustdesk-server-s6:v0-arm64v8`     |
+| multiarch | v0.2.0  | `czyt/rustdesk-server-s6:v0.2.0`         |
+| amd64     | v0.2.0  | `czyt/rustdesk-server-s6:v0.2.0-amd64`   |
+| arm64v8   | v0.2.0  | `czyt/rustdesk-server-s6:v0.2.0-arm64v8` |
+
+从 `v0.2.0` 起，S6 镜像依赖 `czyt/rustdesk-console` 作为 API base image，因此仅发布 `amd64` 和 `arm64v8`。Classic 镜像仍按独立流程构建。
 
 强烈建议您使用`major version` 或 `latest` tag 的 `multiarch` 架构的镜像。
 

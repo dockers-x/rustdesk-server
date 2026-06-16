@@ -75,7 +75,6 @@ jobs:
         job:
           - { name: "amd64",   docker_platform: "linux/amd64",  s6_platform: "x86_64" }
           - { name: "arm64v8", docker_platform: "linux/arm64",  s6_platform: "aarch64" }
-          - { name: "armv7",   docker_platform: "linux/arm/v7", s6_platform: "armhf" }
 
     steps:
       - name: Checkout
@@ -251,7 +250,16 @@ jobs:
 
       - name: Create and push manifests
         run: |
-          create_manifest() {
+          create_s6_manifest() {
+            image="$1"
+            tag="$2"
+            docker buildx imagetools create \
+              -t "${image}:${tag}" \
+              "${image}:${tag}-amd64" \
+              "${image}:${tag}-arm64v8"
+          }
+
+          create_classic_manifest() {
             image="$1"
             tag="$2"
             docker buildx imagetools create \
@@ -261,8 +269,14 @@ jobs:
               "${image}:${tag}-armv7"
           }
 
-          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE" "$DOCKERHUB_IMAGE_CLASSIC" "$GHCR_IMAGE_CLASSIC"; do
-            create_manifest "$image" "$GIT_TAG"
-            create_manifest "$image" "$MAJOR_TAG"
-            create_manifest "$image" "$LATEST_TAG"
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            create_s6_manifest "$image" "$GIT_TAG"
+            create_s6_manifest "$image" "$MAJOR_TAG"
+            create_s6_manifest "$image" "$LATEST_TAG"
+          done
+
+          for image in "$DOCKERHUB_IMAGE_CLASSIC" "$GHCR_IMAGE_CLASSIC"; do
+            create_classic_manifest "$image" "$GIT_TAG"
+            create_classic_manifest "$image" "$MAJOR_TAG"
+            create_classic_manifest "$image" "$LATEST_TAG"
           done
