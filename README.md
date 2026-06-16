@@ -6,14 +6,14 @@
 [![build](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml)
 
 - 解决当客户端登录了`API`账号时链接超时的问题
-- s6镜像添加了`API`支持，`API`开源地址 https://github.com/lejianwen/rustdesk-api
+- s6镜像添加了`API`支持；从 `v0.2.0` 起，API base image 改为 `czyt/rustdesk-console:latest`
 - 是否必须登录才能链接， `MUST_LOGIN` 默认为 `N`，设置为 `Y` 则必须登录才能链接
 - `RUSTDESK_API_JWT_KEY`，设置后会通过`JWT`校验token的合法性
 - 支持client websocket (client >= 1.4.1)
 
 ## docker镜像地址
 
-- s6 镜像 [lejianwen/rustdesk-server-s6](https://hub.docker.com/r/lejianwen/rustdesk-server-s6)
+- s6 镜像 [czyt/rustdesk-server-s6](https://hub.docker.com/r/czyt/rustdesk-server-s6)
 
 ```yaml
  networks:
@@ -29,7 +29,7 @@
        - 21117:21117
        - 21118:21118
        - 21119:21119
-     image: lejianwen/rustdesk-server-s6:latest
+     image: czyt/rustdesk-server-s6:latest
      environment:
        - RELAY=<relay_server[:port]>
        - ENCRYPTED_ONLY=1
@@ -51,6 +51,26 @@
 
 - 普通镜像 [lejianwen/rustdesk-server](https://hub.docker.com/r/lejianwen/rustdesk-server)
 
+## v0.2.0 API base image 变化
+
+从 `v0.2.0` 起，S6 镜像不再基于 `lejianwen/rustdesk-api:latest` 构建，改为基于 `czyt/rustdesk-console:latest` 构建。`czyt/rustdesk-console` 提供 Rust 重写后的 API server，S6 overlay 仍由本仓库的 `docker/Dockerfile` 安装，并继续负责同时拉起 `hbbs`、`hbbr` 和 API 服务。
+
+API 服务在 S6 中的启动命令为：
+
+```sh
+cd /app
+./rustdesk-console -c ./conf/config.yaml
+```
+
+API 数据目录保持为 `/app/data`，默认 SQLite 数据库路径为 `/app/data/rustdeskapi.db`。因此现有挂载方式仍然可用：
+
+```yaml
+volumes:
+  - /data/rustdesk/api:/app/data
+```
+
+最终镜像入口仍为 S6 的 `/init`，base 镜像中的 `CMD` 会被清空，避免 `rustdesk-console` 的默认启动命令作为参数传给 `/init`。
+
 
 # API功能截图
 
@@ -58,7 +78,7 @@
 
 ![commnd.png](./readme/command_simple.png)
 
-更多查看 [RustDesk Api](https://github.com/lejianwen/rustdesk-api)
+API 服务现由 `czyt/rustdesk-console:latest` 镜像提供。
 
 
 --- 
@@ -179,26 +199,26 @@ services:
 
 ## 基于 S6-overlay 的镜像
 
-> 这些镜像是针对 `busybox:stable` 构建的，并添加了可执行程序（hbbr 和 hbbs）以及 [S6-overlay](https://github.com/just-containers/s6-overlay)。 它们可以使用以下tag在 [Docker hub](https://hub.docker.com/r/lejianwen/rustdesk-server-s6/) 上获取：
+> 从 `v0.2.0` 起，这些镜像基于 `czyt/rustdesk-console:latest` 构建，并添加可执行程序（hbbr 和 hbbs）以及 [S6-overlay](https://github.com/just-containers/s6-overlay)。 它们可以使用以下tag在 [Docker hub](https://hub.docker.com/r/czyt/rustdesk-server-s6/) 上获取：
 
 
 | 架構      | version | image:tag                                    |
 | --------- | ------- | -------------------------------------------- |
-| multiarch | latest  | `lejianwen/rustdesk-server-s6:latest`         |
-| amd64     | latest  | `lejianwen/rustdesk-server-s6:latest-amd64`   |
-| i386      | latest  | `lejianwen/rustdesk-server-s6:latest-i386`    |
-| arm64v8   | latest  | `lejianwen/rustdesk-server-s6:latest-arm64v8` |
-| armv7     | latest  | `lejianwen/rustdesk-server-s6:latest-armv7`   |
-| multiarch | 2       | `lejianwen/rustdesk-server-s6:2`              |
-| amd64     | 2       | `lejianwen/rustdesk-server-s6:2-amd64`        |
-| i386      | 2       | `lejianwen/rustdesk-server-s6:2-i386`         |
-| arm64v8   | 2       | `lejianwen/rustdesk-server-s6:2-arm64v8`      |
-| armv7     | 2       | `lejianwen/rustdesk-server-s6:2-armv7`        |
-| multiarch | 2.0.0   | `lejianwen/rustdesk-server-s6:2.0.0`          |
-| amd64     | 2.0.0   | `lejianwen/rustdesk-server-s6:2.0.0-amd64`    |
-| i386      | 2.0.0   | `lejianwen/rustdesk-server-s6:2.0.0-i386`     |
-| arm64v8   | 2.0.0   | `lejianwen/rustdesk-server-s6:2.0.0-arm64v8`  |
-| armv7     | 2.0.0   | `lejianwen/rustdesk-server-s6:2.0.0-armv7`    |
+| multiarch | latest  | `czyt/rustdesk-server-s6:latest`         |
+| amd64     | latest  | `czyt/rustdesk-server-s6:latest-amd64`   |
+| i386      | latest  | `czyt/rustdesk-server-s6:latest-i386`    |
+| arm64v8   | latest  | `czyt/rustdesk-server-s6:latest-arm64v8` |
+| armv7     | latest  | `czyt/rustdesk-server-s6:latest-armv7`   |
+| multiarch | 2       | `czyt/rustdesk-server-s6:2`              |
+| amd64     | 2       | `czyt/rustdesk-server-s6:2-amd64`        |
+| i386      | 2       | `czyt/rustdesk-server-s6:2-i386`         |
+| arm64v8   | 2       | `czyt/rustdesk-server-s6:2-arm64v8`      |
+| armv7     | 2       | `czyt/rustdesk-server-s6:2-armv7`        |
+| multiarch | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0`          |
+| amd64     | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-amd64`    |
+| i386      | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-i386`     |
+| arm64v8   | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-arm64v8`  |
+| armv7     | 2.0.0   | `czyt/rustdesk-server-s6:2.0.0-armv7`    |
 
 强烈建议您使用`major version` 或 `latest` tag 的 `multiarch` 架构的镜像。
 
@@ -211,7 +231,7 @@ docker run --name rustdesk-server \
   --net=host \
   -e "RELAY=rustdeskrelay.example.com" \
   -e "ENCRYPTED_ONLY=1" \
-  -v "$PWD/data:/data" -d lejianwen/rustdesk-server-s6:latest
+  -v "$PWD/data:/data" -d czyt/rustdesk-server-s6:latest
 ```
 
 或刪去 `--net=host` 参数， 但 P2P 直连功能将无法工作。
@@ -222,7 +242,7 @@ docker run --name rustdesk-server \
   -p 21117:21117 -p 21118:21118 -p 21119:21119 \
   -e "RELAY=rustdeskrelay.example.com" \
   -e "ENCRYPTED_ONLY=1" \
-  -v "$PWD/data:/data" -d lejianwen/rustdesk-server-s6:latest
+  -v "$PWD/data:/data" -d czyt/rustdesk-server-s6:latest
 ```
 
 或着您也可以使用 docker-compose 文件:
@@ -241,7 +261,7 @@ services:
       - 21117:21117
       - 21118:21118
       - 21119:21119
-    image: lejianwen/rustdesk-server-s6:latest
+    image: czyt/rustdesk-server-s6:latest
     environment:
       - "RELAY=rustdesk.example.com:21117"
       - "ENCRYPTED_ONLY=1"
@@ -279,7 +299,7 @@ docker run --name rustdesk-server \
   -e "DB_URL=/db/db_v2.sqlite3" \
   -e "KEY_PRIV=FR2j78IxfwJNR+HjLluQ2Nh7eEryEeIZCwiQDPVe+PaITKyShphHAsPLn7So0OqRs92nGvSRdFJnE2MSyrKTIQ==" \
   -e "KEY_PUB=iEyskoaYRwLDy5+0qNDqkbPdpxr0kXRSZxNjEsqykyE=" \
-  -v "$PWD/db:/db" -d lejianwen/rustdesk-server-s6:latest
+  -v "$PWD/db:/db" -d czyt/rustdesk-server-s6:latest
 ```
 
 ```yaml
@@ -296,7 +316,7 @@ services:
       - 21117:21117
       - 21118:21118
       - 21119:21119
-    image: lejianwen/rustdesk-server-s6:latest
+    image: czyt/rustdesk-server-s6:latest
     environment:
       - "RELAY=rustdesk.example.com:21117"
       - "ENCRYPTED_ONLY=1"
@@ -324,7 +344,7 @@ docker service create --name rustdesk-server \
   -e "ENCRYPTED_ONLY=1" \
   -e "DB_URL=/db/db_v2.sqlite3" \
   --mount "type=bind,source=$PWD/db,destination=/db" \
-  lejianwen/rustdesk-server-s6:latest
+  czyt/rustdesk-server-s6:latest
 ```
 
 ```yaml
@@ -341,7 +361,7 @@ services:
       - 21117:21117
       - 21118:21118
       - 21119:21119
-    image: lejianwen/rustdesk-server-s6:latest
+    image: czyt/rustdesk-server-s6:latest
     environment:
       - "RELAY=rustdesk.example.com:21117"
       - "ENCRYPTED_ONLY=1"
@@ -373,7 +393,7 @@ secrets:
 如果您沒有（或不想）在系统上安装 `rustdesk-utils` 套件，您可以使用 Docker 执行相同的命令：
 
 ```bash
-docker run --rm --entrypoint /usr/bin/rustdesk-utils  lejianwen/rustdesk-server-s6:latest genkeypair
+docker run --rm --entrypoint /usr/bin/rustdesk-utils  czyt/rustdesk-server-s6:latest genkeypair
 ```
 
 运行后的输出内容如下：
