@@ -8,6 +8,7 @@
 - Whether login is required to connect, `MUST_LOGIN` defaults to `N`, set to `Y` to require login for connection
 - `RUSTDESK_API_JWT_KEY`, when set, validates the token's legitimacy through `JWT`
 - Support client websocket (client >= 1.4.1)
+- Embedded WebClient supports `RUSTDESK_API_RUSTDESK_WS_HOST`: when set it uses `<ws-host>/ws/id` and `<ws-host>/ws/relay`; when empty it keeps the existing `id-server + 2` and `relay-server + 2` behavior for `21118/21119`
 
 ## docker 
 
@@ -36,6 +37,7 @@
        - RUSTDESK_API_RUSTDESK_ID_SERVER=<id_server[:21116]>
        - RUSTDESK_API_RUSTDESK_RELAY_SERVER=<relay_server[:21117]>
        - RUSTDESK_API_RUSTDESK_API_SERVER=http://<api_server[:21114]>
+       - RUSTDESK_API_RUSTDESK_WS_HOST=wss://<webclient_ws_host>
        - RUSTDESK_API_KEY_FILE=/data/id_ed25519.pub
        - RUSTDESK_API_JWT_KEY=xxxxxx # jwt key
      volumes:
@@ -48,6 +50,69 @@
 ```
 
 - Common Image [lejianwen/rustdesk-server](https://hub.docker.com/r/lejianwen/rustdesk-server)
+
+## WebClient + Cloudflare Tunnel
+
+Embedded WebClient connects to hbbs/hbbr websocket from the browser. By default
+it derives `21118` from `RUSTDESK_API_RUSTDESK_ID_SERVER` and `21119` from
+`RUSTDESK_API_RUSTDESK_RELAY_SERVER`.
+
+When API port `21114` is exposed through Cloudflare Tunnel, you can expose the
+WebClient websocket on the same public host with path routing:
+
+```text
+https://rd.example.com          -> rustdesk-console 21114
+wss://rd.example.com/ws/id      -> hbbs websocket 21118
+wss://rd.example.com/ws/relay   -> hbbr websocket 21119
+```
+
+Container environment:
+
+```env
+RUSTDESK_API_RUSTDESK_API_SERVER=https://rd.example.com
+RUSTDESK_API_RUSTDESK_WS_HOST=https://rd.example.com
+RUSTDESK_API_RUSTDESK_ID_SERVER=<native-client-reachable-host:21116>
+RUSTDESK_API_RUSTDESK_RELAY_SERVER=<native-client-reachable-host:21117>
+```
+
+When `RUSTDESK_API_RUSTDESK_WS_HOST` is set, WebClient uses
+`<ws-host>/ws/id` and `<ws-host>/ws/relay`. When it is empty, WebClient keeps
+the old direct `21118/21119` behavior. `ws-host` may be `https://rd.example.com`
+or `wss://rd.example.com`; WebClient will connect with websocket protocol.
+
+Cloudflare Zero Trust Dashboard public hostname rules:
+
+| Hostname | Path | Type | URL |
+| --- | --- | --- | --- |
+| `rd.example.com` | `/ws/id` | `HTTP` | `rustdesk:21118` |
+| `rd.example.com` | `/ws/relay` | `HTTP` | `rustdesk:21119` |
+| `rd.example.com` | empty | `HTTP` | `rustdesk:21114` |
+
+Local `cloudflared` ingress example:
+
+```yaml
+tunnel: <Tunnel-UUID>
+credentials-file: /etc/cloudflared/<Tunnel-UUID>.json
+
+ingress:
+  - hostname: rd.example.com
+    path: ^/ws/id/?$
+    service: http://rustdesk:21118
+  - hostname: rd.example.com
+    path: ^/ws/relay/?$
+    service: http://rustdesk:21119
+  - hostname: rd.example.com
+    service: http://rustdesk:21114
+  - service: http_status:404
+```
+
+`rustdesk` is the docker compose service name; if cloudflared is outside the
+docker network, use an internal IP it can reach. The tunnel-to-container service
+can be plain `http://`; the browser-to-Cloudflare side is `https://` / `wss://`.
+
+This only fixes WebClient `21118/21119` websocket. Native RustDesk clients still
+need `21115`, `21116/tcp`, `21116/udp`, and `21117` through your existing port
+forwarding path.
 
 
 # API Screenshot

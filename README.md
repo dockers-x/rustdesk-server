@@ -10,6 +10,7 @@
 - 是否必须登录才能链接， `MUST_LOGIN` 默认为 `N`，设置为 `Y` 则必须登录才能链接
 - `RUSTDESK_API_JWT_KEY`，设置后会通过`JWT`校验token的合法性
 - 支持client websocket (client >= 1.4.1)
+- 内嵌 WebClient 支持 `RUSTDESK_API_RUSTDESK_WS_HOST`：设置后走 `<ws-host>/ws/id` 和 `<ws-host>/ws/relay`；不设置则继续按 `id-server + 2`、`relay-server + 2` 连接 `21118/21119`
 
 ## docker镜像地址
 
@@ -38,6 +39,7 @@
        - RUSTDESK_API_RUSTDESK_ID_SERVER=<id_server[:21116]>
        - RUSTDESK_API_RUSTDESK_RELAY_SERVER=<relay_server[:21117]>
        - RUSTDESK_API_RUSTDESK_API_SERVER=http://<api_server[:21114]>
+       - RUSTDESK_API_RUSTDESK_WS_HOST=wss://<webclient_ws_host>
        - RUSTDESK_API_KEY_FILE=/data/id_ed25519.pub
        - RUSTDESK_API_JWT_KEY=xxxxxx # jwt key
      volumes:
@@ -70,6 +72,68 @@ volumes:
 ```
 
 最终镜像入口仍为 S6 的 `/init`，base 镜像中的 `CMD` 会被清空，避免 `rustdesk-console` 的默认启动命令作为参数传给 `/init`。
+
+## WebClient + Cloudflare Tunnel
+
+内嵌 WebClient 需要浏览器能访问 hbbs/hbbr 的 websocket。默认情况下它会从
+`RUSTDESK_API_RUSTDESK_ID_SERVER` 推导 `21118`，从
+`RUSTDESK_API_RUSTDESK_RELAY_SERVER` 推导 `21119`。
+
+如果你把 API `21114` 通过 Cloudflare Tunnel 暴露出去，也可以把 WebClient websocket
+放在同一个公网域名的子路径下：
+
+```text
+https://rd.example.com          -> rustdesk-console 21114
+wss://rd.example.com/ws/id      -> hbbs websocket 21118
+wss://rd.example.com/ws/relay   -> hbbr websocket 21119
+```
+
+容器环境变量这样配：
+
+```env
+RUSTDESK_API_RUSTDESK_API_SERVER=https://rd.example.com
+RUSTDESK_API_RUSTDESK_WS_HOST=https://rd.example.com
+RUSTDESK_API_RUSTDESK_ID_SERVER=<原生客户端可访问的地址:21116>
+RUSTDESK_API_RUSTDESK_RELAY_SERVER=<原生客户端可访问的地址:21117>
+```
+
+`RUSTDESK_API_RUSTDESK_WS_HOST` 设置后，WebClient 固定使用
+`<ws-host>/ws/id` 和 `<ws-host>/ws/relay`；不设置时保持旧逻辑，继续直连
+`21118/21119`。`ws-host` 可以写 `https://rd.example.com` 或
+`wss://rd.example.com`，WebClient 会用 websocket 协议连接。
+
+Cloudflare Zero Trust Dashboard 中可以配置 3 条 Public Hostname 规则：
+
+| Hostname | Path | Type | URL |
+| --- | --- | --- | --- |
+| `rd.example.com` | `/ws/id` | `HTTP` | `rustdesk:21118` |
+| `rd.example.com` | `/ws/relay` | `HTTP` | `rustdesk:21119` |
+| `rd.example.com` | 空 | `HTTP` | `rustdesk:21114` |
+
+如果用本地 `cloudflared` 配置文件，ingress 示例：
+
+```yaml
+tunnel: <Tunnel-UUID>
+credentials-file: /etc/cloudflared/<Tunnel-UUID>.json
+
+ingress:
+  - hostname: rd.example.com
+    path: ^/ws/id/?$
+    service: http://rustdesk:21118
+  - hostname: rd.example.com
+    path: ^/ws/relay/?$
+    service: http://rustdesk:21119
+  - hostname: rd.example.com
+    service: http://rustdesk:21114
+  - service: http_status:404
+```
+
+这里的 `rustdesk` 是 docker compose 里的服务名；如果 cloudflared 不在同一个
+docker network，就改成它能访问到的内网 IP。Tunnel 到容器内部用 `http://` 即可，
+浏览器到 Cloudflare 才是 `https://` / `wss://`。
+
+注意：这只解决 WebClient 的 `21118/21119` websocket。RustDesk 原生客户端仍然需要
+能访问 `21115`、`21116/tcp`、`21116/udp`、`21117`，按你的现有端口转发方式处理。
 
 
 # API功能截图
