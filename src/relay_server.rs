@@ -8,7 +8,7 @@ use hbb_common::{
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
-    tcp::{listen_any, FramedStream},
+    tcp::FramedStream,
     timeout,
     tokio::{
         self,
@@ -24,7 +24,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::prelude::*,
     io::Error,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -46,7 +46,11 @@ const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
 #[tokio::main(flavor = "multi_thread")]
-pub async fn start(port: &str, key: &str) -> ResultType<()> {
+pub async fn start_with_bind(
+    bind_addr: Option<IpAddr>,
+    port: &str,
+    key: &str,
+) -> ResultType<()> {
     let key = get_server_sk(key);
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
@@ -85,7 +89,12 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     let main_task = async move {
         loop {
             log::info!("Start");
-            io_loop(listen_any(port).await?, listen_any(port2).await?, &key).await;
+            io_loop(
+                crate::common::listen_tcp(bind_addr, port).await?,
+                crate::common::listen_tcp(bind_addr, port2).await?,
+                &key,
+            )
+            .await;
         }
     };
     let listen_signal = crate::common::listen_signal();
@@ -96,8 +105,8 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
 }
 
 fn check_params() {
-    let tmp = std::env::var("DOWNGRADE_THRESHOLD")
-        .map(|x| x.parse::<f64>().unwrap_or(0.))
+    let tmp = crate::common::get_arg("DOWNGRADE_THRESHOLD")
+        .parse::<f64>()
         .unwrap_or(0.);
     if tmp > 0. {
         DOWNGRADE_THRESHOLD_100.store((tmp * 100.) as _, Ordering::SeqCst);
@@ -106,8 +115,8 @@ fn check_params() {
         "DOWNGRADE_THRESHOLD: {}",
         DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100.
     );
-    let tmp = std::env::var("DOWNGRADE_START_CHECK")
-        .map(|x| x.parse::<usize>().unwrap_or(0))
+    let tmp = crate::common::get_arg("DOWNGRADE_START_CHECK")
+        .parse::<usize>()
         .unwrap_or(0);
     if tmp > 0 {
         DOWNGRADE_START_CHECK.store(tmp * 1000, Ordering::SeqCst);
@@ -116,8 +125,8 @@ fn check_params() {
         "DOWNGRADE_START_CHECK: {}s",
         DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000
     );
-    let tmp = std::env::var("LIMIT_SPEED")
-        .map(|x| x.parse::<f64>().unwrap_or(0.))
+    let tmp = crate::common::get_arg("LIMIT_SPEED")
+        .parse::<f64>()
         .unwrap_or(0.);
     if tmp > 0. {
         LIMIT_SPEED.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
@@ -126,8 +135,8 @@ fn check_params() {
         "LIMIT_SPEED: {}Mb/s",
         LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
     );
-    let tmp = std::env::var("TOTAL_BANDWIDTH")
-        .map(|x| x.parse::<f64>().unwrap_or(0.))
+    let tmp = crate::common::get_arg("TOTAL_BANDWIDTH")
+        .parse::<f64>()
         .unwrap_or(0.);
     if tmp > 0. {
         TOTAL_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
@@ -137,8 +146,8 @@ fn check_params() {
         "TOTAL_BANDWIDTH: {}Mb/s",
         TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
     );
-    let tmp = std::env::var("SINGLE_BANDWIDTH")
-        .map(|x| x.parse::<f64>().unwrap_or(0.))
+    let tmp = crate::common::get_arg("SINGLE_BANDWIDTH")
+        .parse::<f64>()
         .unwrap_or(0.);
     if tmp > 0. {
         SINGLE_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
@@ -401,6 +410,15 @@ async fn make_pair(
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
             let headers = req.headers();
+            // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
+            // client IP is preserved when the WebSocket port runs behind a
+            // reverse proxy (WSS). They are NOT validated: anyone who can reach
+            // this port directly can spoof an arbitrary IP, bypassing IP-based
+            // rate limiting / blocking and corrupting logged IPs. Do not expose
+            // the WebSocket port directly to untrusted networks; only the
+            // reverse proxy, which overwrites these headers, should be able to
+            // connect to it.
+            // https://github.com/rustdesk/rustdesk-server/issues/634
             let real_ip = headers
                 .get("X-Real-IP")
                 .or_else(|| headers.get("X-Forwarded-For"))
