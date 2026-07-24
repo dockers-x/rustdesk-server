@@ -42,13 +42,13 @@ tar cjf target/rustdesk-server-orig.tar.xz \
     --strip-components=1 \
     target/rustdesk-server
 
-# an .orig.tar.xz tarball exists, 
-# work on the debian directory 
+# an .orig.tar.xz tarball exists,
+# work on the debian directory
 
 eval $( dpkg-architecture )
 sed -e "s/{{ ARCH }}/${DEB_TARGET_ARCH}/" \
     debian/control.tpl > target/rustdesk-server/debian/control
-    
+
 
 cd target/rustdesk-server
 dpkg-checkbuilddeps || echo sudo apt install dpkg-dev
