@@ -1,0 +1,40 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-forapi
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Rebase patch stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out forapi
+        uses: actions/checkout@v4
+        with:
+          ref: forapi
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Sync with upstream
+        env:
+          UPSTREAM_URL: https://github.com/rustdesk/rustdesk-server.git
+        run: ./scripts/sync-forapi.sh
+
+      - name: Report conflict guidance
+        if: failure()
+        run: |
+          echo "::error::Patch rebase failed. Resolve the conflict locally, then rerun the workflow."
