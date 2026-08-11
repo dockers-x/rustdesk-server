@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Rebase patch stack
+    name: Merge official upstream
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -37,4 +37,4 @@ jobs:
       - name: Report conflict guidance
         if: failure()
         run: |
-          echo "::error::Patch rebase failed. Resolve the conflict locally, then rerun the workflow."
+          echo "::error::Official upstream merge failed. Resolve the conflict locally on forapi, push it, then rerun the workflow."
