@@ -16,6 +16,14 @@
 
 - s6 镜像 [czyt/rustdesk-server-s6](https://hub.docker.com/r/czyt/rustdesk-server-s6)
 
+启动前先创建 Console feature 的私有持久化目录：
+
+```sh
+sudo install -d -m 700 /data/rustdesk/api-features
+```
+
+当前镜像使用 root；若自行改为其他用户运行，须将该目录及其中的密钥文件改属对应 UID/GID，保持目录 `0700`、文件 `0600`。此前已启用自有签名功能的用户，必须在重建或删除旧容器前，停止服务并安全备份旧容器 `/app/conf/features/self-signed-client.json`，再恢复到主机的新目录；直接添加空挂载会遮住旧文件。详细迁移步骤及 Console v0.2.38 的一次性密钥备份边界见 [客户端能力与 S6 部署说明](docs/client-capabilities.md#s6-deployment-and-console-feature-storage)。
+
 ```yaml
  networks:
    rustdesk-net:
@@ -45,6 +53,7 @@
      volumes:
        - /data/rustdesk/server:/data
        - /data/rustdesk/api:/app/data #将数据库挂载
+       - /data/rustdesk/api-features:/app/conf/features
      networks:
        - rustdesk-net
      restart: unless-stopped

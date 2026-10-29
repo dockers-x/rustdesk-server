@@ -25,6 +25,7 @@ services:
       - /data/rustdesk/server:/data
       - /data/rustdesk/api:/app/data #将数据库挂载
       - /data/rustdesk/server:/app/conf/data #挂载key文件到api容器，可以不用使用 RUSTDESK_API_RUSTDESK_KEY
+      - /data/rustdesk/api-features:/app/conf/features
     networks:
       - rustdesk-net
     restart: unless-stopped
