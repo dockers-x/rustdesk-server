@@ -1,0 +1,22 @@
+name: Rust checks
+
+on:
+  push:
+    branches: [forapi]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libclang-dev pkg-config
+      - run: cargo test --lib --locked

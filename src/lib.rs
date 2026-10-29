@@ -5,5 +5,6 @@ mod database;
 mod geo_relay;
 mod peer;
 mod runtime_config;
+mod switch_grant;
 mod version;
 pub mod jwt;

@@ -1,5 +1,5 @@
 use crate::common::*;
-use crate::{geo_relay, runtime_config};
+use crate::{geo_relay, runtime_config, switch_grant};
 use crate::peer::*;
 use hbb_common::bytes::BufMut;
 use hbb_common::{
@@ -592,6 +592,17 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if !rf.switch_code.is_empty()
+                        && !switch_grant::allows_relay(&rf, key)
+                    {
+                        let mut response = RendezvousMessage::new();
+                        response.set_relay_response(RelayResponse {
+                            refuse_reason: "Invalid or expired switch grant".to_owned(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, response).await;
+                        return true;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -958,7 +969,17 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         // if secret is not empty check token by jwt
-        if MUST_LOGIN.load(Ordering::SeqCst) {
+        if !ph.switch_code.is_empty()
+            && !switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type)
+        {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: "Invalid or expired switch grant".to_owned(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if MUST_LOGIN.load(Ordering::SeqCst) && ph.switch_code.is_empty() {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1207,6 +1228,12 @@ impl RendezvousServer {
         let mut res = "".to_owned();
         let mut fds = cmd.trim().split(' ');
         match fds.next() {
+            Some("register-switch-grant") => {
+                return match (fds.next(), fds.next()) {
+                    (Some(encoded), None) => switch_grant::register_command(encoded, &self.pm).await,
+                    _ => "{\"accepted\":false}".to_owned(),
+                };
+            }
             Some("h") => {
                 res = format!(
                     "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
