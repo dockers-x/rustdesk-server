@@ -1,4 +1,4 @@
-FROM czyt/rustdesk-console:latest
+FROM czyt/rustdesk-console:v0.2.39@sha256:e738dfa4563cb48ae7faa89640d645c6afad80dc6951583f6121f4345419bc0f
 
 ARG S6_OVERLAY_VERSION=3.2.0.0
 ARG S6_ARCH=x86_64
