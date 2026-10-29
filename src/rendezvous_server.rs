@@ -1,5 +1,5 @@
 use crate::common::*;
-use crate::{geo_relay, runtime_config, switch_grant};
+use crate::{geo_relay, routing_auth, runtime_config, switch_grant, transport_hints};
 use crate::peer::*;
 use hbb_common::bytes::BufMut;
 use hbb_common::{
@@ -592,15 +592,14 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
-                    if MUST_LOGIN.load(Ordering::SeqCst)
-                        && !rf.switch_code.is_empty()
-                        && !switch_grant::allows_relay(&rf, key)
-                    {
+                    if let Some(denial) = routing_auth::relay_denial(
+                        &rf,
+                        key,
+                        MUST_LOGIN.load(Ordering::SeqCst),
+                        &jwt::SECRET,
+                    ) {
                         let mut response = RendezvousMessage::new();
-                        response.set_relay_response(RelayResponse {
-                            refuse_reason: "Invalid or expired switch grant".to_owned(),
-                            ..Default::default()
-                        });
+                        response.set_relay_response(denial);
                         Self::send_to_sink(sink, response).await;
                         return true;
                     }
@@ -634,6 +633,7 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    transport_hints::relay_response(ALWAYS_USE_RELAY.load(Ordering::SeqCst), &mut rr);
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
@@ -907,6 +907,11 @@ impl RendezvousServer {
             relay_server: phs.relay_server.clone(),
             ..Default::default()
         };
+        transport_hints::response(
+            phs.socket_addr_v6,
+            ALWAYS_USE_RELAY.load(Ordering::SeqCst),
+            &mut p,
+        );
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
@@ -941,6 +946,11 @@ impl RendezvousServer {
             relay_server: la.relay_server,
             ..Default::default()
         };
+        transport_hints::response(
+            la.socket_addr_v6,
+            ALWAYS_USE_RELAY.load(Ordering::SeqCst),
+            &mut p,
+        );
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
@@ -960,40 +970,15 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+        if let Some(denial) = routing_auth::punch_denial(
+            &ph,
+            key,
+            MUST_LOGIN.load(Ordering::SeqCst),
+            &jwt::SECRET,
+        ) {
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse {
-                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
-                ..Default::default()
-            });
+            msg_out.set_punch_hole_response(denial);
             return Ok((msg_out, None));
-        }
-        // if secret is not empty check token by jwt
-        if MUST_LOGIN.load(Ordering::SeqCst)
-            && !(!ph.switch_code.is_empty()
-                && switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type))
-        {
-            if ph.token.is_empty() {
-                let mut msg_out = RendezvousMessage::new();
-                msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: String::from("Connection failed, please login!"),
-                    ..Default::default()
-                });
-                return Ok((msg_out, None));
-            } else if !jwt::SECRET.is_empty() {
-                let token = ph.token;
-                let token = jwt::verify_token(token.as_str());
-                if token.is_err() {
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_punch_hole_response(PunchHoleResponse {
-                        //提示重新登录
-                        other_failure: String::from("Token error, please log out and log back in!"),
-                        ..Default::default()
-                    });
-                    return Ok((msg_out, None));
-                }
-            }
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -1027,7 +1012,11 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            let force_relay = transport_hints::force_relay(
+                ph.force_relay,
+                ALWAYS_USE_RELAY.load(Ordering::SeqCst),
+            );
+            if force_relay || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -1035,6 +1024,7 @@ impl RendezvousServer {
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
             let same_intranet: bool = !ws
+                && !force_relay
                 && (peer_is_lan && is_lan || {
                     match (peer_addr, addr) {
                         (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
@@ -1069,7 +1059,7 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            //
+            transport_hints::request(ph.socket_addr_v6, force_relay, &mut msg_out);
             Ok((msg_out, Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();

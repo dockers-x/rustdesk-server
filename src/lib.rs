@@ -5,6 +5,8 @@ mod database;
 mod geo_relay;
 mod peer;
 mod runtime_config;
+mod routing_auth;
 mod switch_grant;
+mod transport_hints;
 mod version;
 pub mod jwt;

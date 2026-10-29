@@ -227,12 +227,10 @@ pub(crate) fn allows_relay(request: &RequestRelay, key: &str) -> bool {
     if !key.is_empty() && !request.licence_key.is_empty() && request.licence_key != key {
         return false;
     }
-    let valid_grant = GRANTS
+    GRANTS
         .lock()
         .unwrap()
-        .allows_relay(request, key, Instant::now());
-    valid_grant
-        || (!crate::jwt::SECRET.is_empty() && crate::jwt::verify_token(&request.token).is_ok())
+        .allows_relay(request, key, Instant::now())
 }
 
 #[cfg(test)]
@@ -372,6 +370,41 @@ mod tests {
         assert!(store.allows_relay(&relay, "configured-server-key", now));
         relay.licence_key.clear();
         assert!(!store.allows_relay(&relay, "configured-server-key", now + GRANT_TTL));
+    }
+
+    #[test]
+    fn signed_grant_authorizes_both_routes_without_a_jwt_key() {
+        use hbb_common::rendezvous_proto::PunchHoleRequest;
+
+        let (public_key, secret_key) = sign::gen_keypair();
+        let code = base64::encode(sha256::hash(b"routing-auth-grant").0);
+        let mut registration = request(&secret_key, &code);
+        registration.id = "routing-auth-grant-peer".to_owned();
+        registration.signature = base64::encode(
+            sign::sign_detached(&signed_message(&registration), &secret_key).to_bytes(),
+        );
+        assert!(GRANTS
+            .lock()
+            .unwrap()
+            .register(&registration, &public_key.0, 1700000000, Instant::now())
+            .accepted);
+        let mut punch = PunchHoleRequest {
+            id: registration.id.clone(),
+            licence_key: "server-key".to_owned(),
+            switch_code: code.clone(),
+            ..Default::default()
+        };
+        let mut relay = RequestRelay {
+            id: registration.id,
+            switch_code: code,
+            ..Default::default()
+        };
+        assert!(crate::routing_auth::punch_denial(&punch, "server-key", true, "").is_none());
+        assert!(crate::routing_auth::relay_denial(&relay, "server-key", true, "").is_none());
+        punch.id = "different-peer".to_owned();
+        relay.id = "different-peer".to_owned();
+        assert!(crate::routing_auth::punch_denial(&punch, "server-key", true, "").is_some());
+        assert!(crate::routing_auth::relay_denial(&relay, "server-key", true, "").is_some());
     }
 
     #[test]

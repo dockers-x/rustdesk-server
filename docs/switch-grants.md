@@ -32,7 +32,7 @@ carrying `C` to the signed destination ID for ten seconds. It does not authorize
 other session types or replace the destination's password/whitelist checks.
 Punch-hole requests retain their existing server licence-key check. The stock
 client's `RequestRelay` does not populate `licence_key`, and the existing relay
-path does not require it. Explicit switch relay requests therefore preserve the
+path does not require it. Relay requests therefore preserve the
 absent-key shape, reject a nonempty supplied key that mismatches a configured
 server key, and, when must-login is enabled, require either the verified
 destination-bound desktop grant or a valid account JWT verified with the
@@ -42,9 +42,13 @@ registered signing key, not proof that the requester knows a server secret.
 When must-login is disabled, punch-hole and relay requests retain their existing
 behavior even if they carry a switch code and no grant has been registered. This
 preserves switching on ID-only deployments without a Console API. When must-login
-is enabled, an absent/invalid grant does not prevent punch-hole requests from
-using their existing token authentication. Requests without a switch code retain
-the existing behavior, including existing relay authentication behavior.
+is enabled, both punch-hole and relay requests require either a valid grant or
+valid account JWT, including requests without a switch code. An absent/invalid
+grant does not prevent either route from using JWT authentication. JWT
+verification fails closed when `RUSTDESK_API_JWT_KEY` is empty: an arbitrary
+nonempty token is not authentication. Configure the same JWT key in Console and
+hbbs before enabling must-login. A valid grant remains usable without that JWT
+key because its authorization uses the destination's registered signing key.
 
 Routing grants are reusable within their original ten seconds because the client
 uses fresh sockets and relay UUIDs during fallback. The destination independently
