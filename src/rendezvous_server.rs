@@ -683,17 +683,12 @@ impl RendezvousServer {
                     }
                     log::trace!("KeyExchange their_pk: {:?}", hex::encode(&ex.keys[0]));
                     log::trace!("KeyExchange box: {:?}", hex::encode(&ex.keys[1]));
-                    let their_pk: [u8; 32] = ex.keys[0].to_vec().try_into().unwrap();
-                    let cryptobox: [u8; 48] = ex.keys[1].to_vec().try_into().unwrap();
-                    let symetric_key = get_symetric_key_from_msg(
-                        self.inner.secure_tcp_sk_b.0,
-                        their_pk,
-                        &cryptobox,
-                    );
-                    log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
-                    let key = secretbox::Key::from_slice(&symetric_key);
-                    match key {
-                        Some(key) => {
+                    match get_symetric_key_from_msg(
+                        &self.inner.secure_tcp_sk_b,
+                        &ex.keys[0],
+                        &ex.keys[1],
+                    ) {
+                        Ok(key) => {
                             if let Some(sink) = sink.as_mut() {
                                 match sink {
                                     Sink::Wss(s) => s.encrypt = Some(Encrypt::new(key)),
@@ -703,8 +698,8 @@ impl RendezvousServer {
                             log::debug!("KeyExchange symetric key set");
                             return true;
                         }
-                        None => {
-                            log::error!("KeyExchange symetric key NOT set");
+                        Err(err) => {
+                            log::trace!("Key exchange with {:?} failed: {}", addr, err);
                             return false;
                         }
                     }
@@ -1748,27 +1743,59 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 }
 
 fn get_symetric_key_from_msg(
-    our_sk_b: [u8; 32],
-    their_pk_b: [u8; 32],
-    sealed_value: &[u8; 48],
-) -> [u8; 32] {
-    let their_pk_b = box_::PublicKey(their_pk_b);
-    let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
-    let sk = box_::SecretKey(our_sk_b);
-    let key = box_::open(sealed_value, &nonce, &their_pk_b, &sk);
-    match key {
-        Ok(key) => {
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key);
-            key_array
-        }
-        Err(e) => panic!("Error while opening the seal key{:?}", e),
-    }
+    our_sk_b: &box_::SecretKey,
+    their_pk_b: &[u8],
+    sealed_value: &[u8],
+) -> ResultType<secretbox::Key> {
+    Encrypt::decode(sealed_value, their_pk_b, our_sk_b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_exchange_decodes_client_key() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (client_pk, client_sk) = box_::gen_keypair();
+        let key = secretbox::gen_key();
+        let sealed = box_::seal(
+            &key.0,
+            &box_::Nonce([0; box_::NONCEBYTES]),
+            &server_pk,
+            &client_sk,
+        );
+        assert_eq!(
+            get_symetric_key_from_msg(&server_sk, &client_pk.0, &sealed).unwrap(),
+            key
+        );
+    }
+
+    #[test]
+    fn key_exchange_rejects_malformed_keys() {
+        let (_, server_sk) = box_::gen_keypair();
+        for (public_key_len, sealed_len) in [(31, 48), (33, 48), (32, 47), (32, 48)] {
+            assert!(get_symetric_key_from_msg(
+                &server_sk,
+                &vec![0; public_key_len],
+                &vec![0; sealed_len],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn key_exchange_rejects_invalid_secret_key_length() {
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (client_pk, client_sk) = box_::gen_keypair();
+        let sealed = box_::seal(
+            &[0; secretbox::KEYBYTES - 1],
+            &box_::Nonce([0; box_::NONCEBYTES]),
+            &server_pk,
+            &client_sk,
+        );
+        assert!(get_symetric_key_from_msg(&server_sk, &client_pk.0, &sealed).is_err());
+    }
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
