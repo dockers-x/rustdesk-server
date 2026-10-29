@@ -592,7 +592,8 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
-                    if !rf.switch_code.is_empty()
+                    if MUST_LOGIN.load(Ordering::SeqCst)
+                        && !rf.switch_code.is_empty()
                         && !switch_grant::allows_relay(&rf, key)
                     {
                         let mut response = RendezvousMessage::new();
@@ -969,17 +970,10 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         // if secret is not empty check token by jwt
-        if !ph.switch_code.is_empty()
-            && !switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type)
+        if MUST_LOGIN.load(Ordering::SeqCst)
+            && !(!ph.switch_code.is_empty()
+                && switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type))
         {
-            let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse {
-                other_failure: "Invalid or expired switch grant".to_owned(),
-                ..Default::default()
-            });
-            return Ok((msg_out, None));
-        }
-        if MUST_LOGIN.load(Ordering::SeqCst) && ph.switch_code.is_empty() {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {

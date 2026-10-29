@@ -224,10 +224,15 @@ pub(crate) fn allows(id: &str, code: &str, conn_type: EnumOrUnknown<ConnType>) -
 }
 
 pub(crate) fn allows_relay(request: &RequestRelay, key: &str) -> bool {
-    GRANTS
+    if !key.is_empty() && !request.licence_key.is_empty() && request.licence_key != key {
+        return false;
+    }
+    let valid_grant = GRANTS
         .lock()
         .unwrap()
-        .allows_relay(request, key, Instant::now())
+        .allows_relay(request, key, Instant::now());
+    valid_grant
+        || (!crate::jwt::SECRET.is_empty() && crate::jwt::verify_token(&request.token).is_ok())
 }
 
 #[cfg(test)]
