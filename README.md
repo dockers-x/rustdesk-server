@@ -526,3 +526,14 @@ Secret Key:  egAVd44u33ZEUIDTtksGcHeVeAwywarEdHmf99KM5ajwEsuG3NQFT9coAfiZ6nen4hf
 | RUST_LOG              | all           | 设置 debug level (error\|warn\|info\|debug\|trace) |
 | SINGLE_BANDWIDTH      | hbbr          | 单个连接的最大带宽（以Mb/s为单位）                              |
 | TOTAL_BANDWIDTH       | hbbr          | 最大总带宽（以Mb/s为单位）                                  |
+
+### 安全连接授权（v0.2.44）
+
+启用 `MUST_LOGIN=Y` 后，还需先升级 Console v0.2.42，并为 hbbs 配置
+`RUSTDESK_API_RUSTDESK_API_SERVER` 和共享的 `RUSTDESK_API_JWT_KEY`。
+普通用户只能向自己的启用设备发起新的连接协调，管理员可访问已登记启用设备；
+仅有地址簿共享权限不会取得设备连接授权。查询失败时拒绝连接。
+
+远程 Console 地址须使用 HTTPS；HTTP 仅允许同网络命名空间的显式 loopback IP。
+`MUST_LOGIN=N`、IP 直连和已建立会话不受此项实时授权约束。
+详见 [环境变量说明](docs/environment-variables.md#console-device-authorization-v0244)。

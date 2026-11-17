@@ -644,6 +644,16 @@ impl RendezvousServer {
                         Self::send_to_sink(sink, response).await;
                         return true;
                     }
+                    if !switch_grant::allows_relay(&rf, key)
+                        && !routing_auth::connection_allowed(&rf.id, &rf.token, MUST_LOGIN.load(Ordering::SeqCst)).await {
+                        let mut response = RendezvousMessage::new();
+                        response.set_relay_response(RelayResponse {
+                            refuse_reason: "Connection not authorized for this device".to_owned(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, response).await;
+                        return true;
+                    }
                     if let Err(err) = validate_relay_uuid(&rf.uuid) {
                         log::warn!(
                             "Drop RequestRelay from {addr}: {err} (length {})",
@@ -1033,6 +1043,15 @@ impl RendezvousServer {
         ) {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(denial);
+            return Ok((msg_out, None));
+        }
+        if !switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type)
+            && !routing_auth::connection_allowed(&ph.id, &ph.token, MUST_LOGIN.load(Ordering::SeqCst)).await {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: "Connection not authorized for this device".to_owned(),
+                ..Default::default()
+            });
             return Ok((msg_out, None));
         }
         let id = ph.id;

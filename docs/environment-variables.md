@@ -261,3 +261,25 @@ ExecStart=/usr/bin/hbbs
 
 Ports 21118/21119 are only needed for the web client; you can omit them
 otherwise.
+
+## Console device authorization (v0.2.44)
+
+With `MUST_LOGIN=Y`, ordinary punch and relay coordination requires both the
+existing JWT validation and a live Console decision for the target device.
+Set `RUSTDESK_API_RUSTDESK_API_SERVER` to Console v0.2.42 or newer and share its
+`RUSTDESK_API_JWT_KEY`. The address must use HTTPS, or HTTP with an explicit
+loopback IP in the same network namespace (for example `http://127.0.0.1:21114`).
+The base path is preserved and `/api/server/authorize-connection` is appended.
+Embedded URL credentials, query strings, fragments and redirects are rejected.
+
+The server sends the stock client token and requested target ID to Console.
+Only an explicit `{"allowed":true}` HTTP 200 response allows the ordinary path;
+missing configuration, malformed/oversized responses, overload and errors deny.
+The lookup has a three-second timeout and at most 32 concurrent requests.
+Console checks current sessions, enabled accounts and devices, and device
+owner/administrator authority. Address-book sharing does not confer routing
+permission. Signed target-bound Switch Sides grants retain their existing path.
+
+`MUST_LOGIN=N` retains legacy unauthenticated routing and does not enforce this
+ACL. Direct-IP traffic and already established sessions do not pass this check.
+Endpoint passwords/approval and network access controls remain necessary.
