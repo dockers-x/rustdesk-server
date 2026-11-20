@@ -527,6 +527,10 @@ Secret Key:  egAVd44u33ZEUIDTtksGcHeVeAwywarEdHmf99KM5ajwEsuG3NQFT9coAfiZ6nen4hf
 | SINGLE_BANDWIDTH      | hbbr          | 单个连接的最大带宽（以Mb/s为单位）                              |
 | TOTAL_BANDWIDTH       | hbbr          | 最大总带宽（以Mb/s为单位）                                  |
 
+### Console 与设备通知（v0.2.46）
+
+Server v0.2.46 的 S6 镜像内置 Console v0.2.46，提供设备上线通知、可复用模板、管理员 TOTP 和结构化认证审计。Classic 部署需单独升级 Console。从旧版升级时，尚未绑定 TOTP 的管理员需从 Console 完成绑定。 [版本说明](docs/releases/v0.2.46.md) · [通知配置](https://github.com/dockers-x/rustdesk-console/blob/v0.2.46/docs/notification-routing.zh-CN.md)
+
 ### 安全连接授权（v0.2.44）
 
 Server v0.2.45 的 S6 镜像内置 Console v0.2.44，恢复默认接收原版客户端心跳、设备信息和审计上报，修复在线设备在控制台显示离线的问题。Classic 镜像需单独升级 Console；旧配置若显式设置 `security.allow-legacy-device-reports: false`，需删除该覆盖或改为 `true` 后重启 Console。
