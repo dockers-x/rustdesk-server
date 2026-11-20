@@ -284,12 +284,12 @@ permission. Signed target-bound Switch Sides grants retain their existing path.
 ACL. Direct-IP traffic and already established sessions do not pass this check.
 Endpoint passwords/approval and network access controls remain necessary.
 
-## Device admission and control permissions (v0.2.48)
+## Device admission and control permissions (v0.2.49)
 
 Configure the same `RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN` on Console and
 each hbbs that should enforce device admission. Use a random secret of at least
 32 characters. Set `RUSTDESK_API_RUSTDESK_API_SERVER` on hbbs to the paired Console
-v0.2.48 API as described above. Console enables its device-admission switch
+v0.2.49 API as described above. Console enables its device-admission switch
 after receiving an authenticated check-in from a paired hbbs.
 
 Admission starts disabled. When enabled, matched approved device keys and
