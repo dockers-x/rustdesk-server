@@ -121,6 +121,18 @@ pub(crate) fn uses_device_admission() -> bool {
     !ADMISSION_TOKEN.is_empty()
 }
 
+pub(crate) async fn refresh_admission_pairing() {
+    let Some(base) = std::env::var("RUSTDESK_API_RUSTDESK_API_SERVER").ok() else {
+        return;
+    };
+    let Some((client, endpoint)) =
+        AUTH_CLIENT.as_ref().zip(console_endpoint(&base, "device-admission/hello"))
+    else {
+        return;
+    };
+    let _ = read_reply::<AuthorizationResponse>(client.post(endpoint).bearer_auth(&*ADMISSION_TOKEN)).await;
+}
+
 pub(crate) async fn device_admission(id: &str, uuid: &[u8], pk: &[u8], observe: bool) -> Admission {
     if !uses_device_admission() {
         return Admission::Allowed;

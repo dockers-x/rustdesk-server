@@ -423,8 +423,12 @@ impl RendezvousServer {
         key: &str,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        let mut timer_admission = interval(Duration::from_secs(15));
         loop {
             tokio::select! {
+                _ = timer_admission.tick(), if routing_auth::uses_device_admission() => {
+                    tokio::spawn(routing_auth::refresh_admission_pairing());
+                }
                 _ = timer_check_relay.tick() => {
                     if self.relay_servers0.len() > 1 {
                         let rs = self.relay_servers0.clone();
