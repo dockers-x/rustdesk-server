@@ -19,27 +19,27 @@ static AUTH_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
 });
 
 /// Recheck current session and target access on every new routed connection.
-/// Mandatory-login deployments fail closed until the paired Console is configured.
-pub(crate) async fn connection_allowed(id: &str, token: &str, must_login: bool) -> bool {
+pub(crate) async fn connection_permissions(id: &str, token: &str, must_login: bool) -> Option<u64> {
     if !must_login {
-        return true;
+        return Some(0);
     }
-    let Ok(base) = std::env::var("RUSTDESK_API_RUSTDESK_API_SERVER") else {
-        return false;
-    };
-    let Some(endpoint) = authorization_endpoint(&base) else {
-        return false;
-    };
-    let Some(client) = AUTH_CLIENT.as_ref() else {
-        return false;
-    };
-    let Ok(_slot) = AUTH_SLOTS.try_acquire() else {
-        return false;
-    };
+    let base = std::env::var("RUSTDESK_API_RUSTDESK_API_SERVER").ok()?;
+    let endpoint = authorization_endpoint(&base)?;
+    let client = AUTH_CLIENT.as_ref()?;
+    let _slot = AUTH_SLOTS.try_acquire().ok()?;
     check_connection(client, endpoint, id, token).await
 }
 
+#[cfg(test)]
+async fn connection_allowed(id: &str, token: &str, must_login: bool) -> bool {
+    connection_permissions(id, token, must_login).await.is_some()
+}
+
 fn authorization_endpoint(base: &str) -> Option<reqwest::Url> {
+    console_endpoint(base, "authorize-connection")
+}
+
+fn console_endpoint(base: &str, endpoint: &str) -> Option<reqwest::Url> {
     let mut url = reqwest::Url::parse(base).ok()?;
     // Never forward user tokens to cleartext remote HTTP or embedded credentials.
     let local = url.host_str().is_some_and(|host| {
@@ -57,7 +57,7 @@ fn authorization_endpoint(base: &str) -> Option<reqwest::Url> {
         return None;
     }
     let path = format!(
-        "{}/api/server/authorize-connection",
+        "{}/api/server/{endpoint}",
         url.path().trim_end_matches('/')
     );
     url.set_path(&path);
@@ -68,6 +68,23 @@ fn authorization_endpoint(base: &str) -> Option<reqwest::Url> {
 #[serde(deny_unknown_fields)]
 struct AuthorizationResponse {
     allowed: bool,
+    #[serde(default)]
+    control_permissions: u64,
+}
+
+async fn read_reply<T: serde::de::DeserializeOwned>(request: reqwest::RequestBuilder) -> Option<T> {
+    let mut response = request.send().await.ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > 256 {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).ok()
 }
 
 async fn check_connection(
@@ -75,31 +92,58 @@ async fn check_connection(
     endpoint: reqwest::Url,
     id: &str,
     token: &str,
-) -> bool {
+) -> Option<u64> {
     if id.is_empty() || id.len() > 128 || token.is_empty() || token.len() > 4096 {
-        return false;
+        return None;
     }
-    let Ok(mut response) = client
-        .post(endpoint)
-        .bearer_auth(token)
-        .json(&serde_json::json!({"id": id}))
-        .send()
-        .await
-    else {
-        return false;
+    let response: AuthorizationResponse = read_reply(
+        client.post(endpoint).bearer_auth(token).json(&serde_json::json!({"id": id})),
+    ).await?;
+    // The only allowed bits encode denials for keyboard, clipboard and file
+    // transfer. An allow bit could weaken the target client's local policy.
+    const ALLOWED_BITS: u64 = 1 | (1 << 4) | (1 << 6);
+    (response.allowed && response.control_permissions & !ALLOWED_BITS == 0)
+        .then_some(response.control_permissions)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Allowed,
+    Pending,
+    Unavailable,
+}
+
+static ADMISSION_TOKEN: Lazy<String> =
+    Lazy::new(|| std::env::var("RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN").unwrap_or_default());
+static ADMISSION_SLOTS: Semaphore = Semaphore::const_new(32);
+
+pub(crate) fn uses_device_admission() -> bool {
+    !ADMISSION_TOKEN.is_empty()
+}
+
+pub(crate) async fn device_admission(id: &str, uuid: &[u8], pk: &[u8], observe: bool) -> Admission {
+    if !uses_device_admission() {
+        return Admission::Allowed;
+    }
+    let Some((client, endpoint)) = AUTH_CLIENT.as_ref().zip(
+        std::env::var("RUSTDESK_API_RUSTDESK_API_SERVER")
+            .ok()
+            .and_then(|base| console_endpoint(&base, "device-admission")),
+    ) else {
+        return Admission::Unavailable;
     };
-    if response.status() != reqwest::StatusCode::OK {
-        return false;
+    let Ok(_slot) = ADMISSION_SLOTS.try_acquire() else {
+        return Admission::Unavailable;
+    };
+    match read_reply::<AuthorizationResponse>(
+        client.post(endpoint).bearer_auth(&*ADMISSION_TOKEN).json(&serde_json::json!({
+            "id": id, "uuid": base64::encode(uuid), "public_key": base64::encode(pk), "observe": observe,
+        })),
+    ).await {
+        Some(response) if response.allowed => Admission::Allowed,
+        Some(_) => Admission::Pending,
+        None => Admission::Unavailable,
     }
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if body.len() + chunk.len() <= 256 => body.extend_from_slice(&chunk),
-            Ok(None) => break,
-            _ => return false,
-        }
-    }
-    serde_json::from_slice::<AuthorizationResponse>(&body).is_ok_and(|response| response.allowed)
 }
 
 pub(crate) fn punch_denial(
@@ -285,6 +329,8 @@ mod connection_authorization_tests {
         for (status, body, expected) in [
             ("200 OK", "{\"allowed\":true}".to_string(), true),
             ("200 OK", "{\"allowed\":false}".to_string(), false),
+            ("200 OK", "{\"allowed\":true,\"control_permissions\":81}".to_string(), true),
+            ("200 OK", "{\"allowed\":true,\"control_permissions\":2}".to_string(), false),
             ("401 Unauthorized", "{\"allowed\":true}".to_string(), false),
             ("200 OK", "{}".to_string(), false),
             ("200 OK", "{\"allowed\":\"true\"}".to_string(), false),
@@ -311,7 +357,7 @@ mod connection_authorization_tests {
                 let _ = socket.write_all(response.as_bytes()).await;
             });
             assert_eq!(
-                check_connection(&client, endpoint, "dummy-device", "dummy-token").await,
+                check_connection(&client, endpoint, "dummy-device", "dummy-token").await.is_some(),
                 expected
             );
             server.await.unwrap();
@@ -320,7 +366,7 @@ mod connection_authorization_tests {
         let endpoint =
             authorization_endpoint(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         drop(listener);
-        assert!(!check_connection(&client, endpoint, "dummy-device", "dummy-token").await);
+        assert!(check_connection(&client, endpoint, "dummy-device", "dummy-token").await.is_none());
         assert!(connection_allowed("dummy-device", "", false).await);
     }
 }

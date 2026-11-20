@@ -106,9 +106,39 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
+static UDP_ADMISSION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 const MAX_RELAY_UUID_LEN: usize = 128;
 
 // The peer sends this uuid to whatever relay_server names, so keep control bytes out of it.
+fn registration_response(
+    response: Result<register_pk_response::Result, register_pk_response::Result>,
+) -> RendezvousMessage {
+    let mut message = RendezvousMessage::new();
+    message.set_register_pk_response(RegisterPkResponse {
+        result: response.unwrap_or_else(|error| error).into(),
+        ..Default::default()
+    });
+    message
+}
+
+fn control_permissions(mask: u64) -> MessageField<ControlPermissions> {
+    MessageField::from_option((mask != 0).then_some(ControlPermissions {
+        permissions: mask,
+        ..Default::default()
+    }))
+}
+
+async fn target_admitted(id: &str, peer: &LockPeer) -> bool {
+    if !routing_auth::uses_device_admission() {
+        return true;
+    }
+    let (uuid, key) = {
+        let peer = peer.read().await;
+        (peer.uuid.clone(), peer.pk.clone())
+    };
+    routing_auth::device_admission(id, &uuid, &key, false).await == routing_auth::Admission::Allowed
+}
+
 fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
     if value.is_empty()
         || value.len() > MAX_RELAY_UUID_LEN
@@ -523,24 +553,19 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr, false).await;
-                    match response {
-                        Err(err) => {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: err.into(),
-                                ..Default::default()
+                    if routing_auth::uses_device_admission() {
+                        if let Ok(slot) = UDP_ADMISSION_SLOTS.try_acquire() {
+                            let mut server = self.clone();
+                            tokio::spawn(async move {
+                                let _slot = slot;
+                                let response = server.handle_register_pk(rk, addr, false).await;
+                                let message = registration_response(response);
+                                let _ = server.tx.send(Data::Msg(message.into(), addr));
                             });
-                            socket.send(&msg_out, addr).await?;
                         }
-                        Ok(res) => {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: res.into(),
-                                ..Default::default()
-                            });
-                            socket.send(&msg_out, addr).await?;
-                        }
+                    } else {
+                        let response = self.handle_register_pk(rk, addr, false).await;
+                        socket.send(&registration_response(response), addr).await?;
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -644,8 +669,14 @@ impl RendezvousServer {
                         Self::send_to_sink(sink, response).await;
                         return true;
                     }
-                    if !switch_grant::allows_relay(&rf, key)
-                        && !routing_auth::connection_allowed(&rf.id, &rf.token, MUST_LOGIN.load(Ordering::SeqCst)).await {
+                    let permissions = if switch_grant::allows_relay(&rf, key) {
+                        Some(0)
+                    } else {
+                        routing_auth::connection_permissions(
+                            &rf.id, &rf.token, MUST_LOGIN.load(Ordering::SeqCst),
+                        ).await
+                    };
+                    let Some(permissions) = permissions else {
                         let mut response = RendezvousMessage::new();
                         response.set_relay_response(RelayResponse {
                             refuse_reason: "Connection not authorized for this device".to_owned(),
@@ -653,7 +684,7 @@ impl RendezvousServer {
                         });
                         Self::send_to_sink(sink, response).await;
                         return true;
-                    }
+                    };
                     if let Err(err) = validate_relay_uuid(&rf.uuid) {
                         log::warn!(
                             "Drop RequestRelay from {addr}: {err} (length {})",
@@ -661,13 +692,23 @@ impl RendezvousServer {
                         );
                         return false;
                     }
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        if !target_admitted(&rf.id, &peer).await {
+                            let mut response = RendezvousMessage::new();
+                            response.set_relay_response(RelayResponse {
+                                refuse_reason: "Device deployment is required".to_owned(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, response).await;
+                            return true;
+                        }
+                        if let Some(sink) = sink.take() {
+                            self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        }
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        // Never forward control bits supplied by the requester.
+                        rf.control_permissions = control_permissions(permissions);
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
@@ -829,6 +870,11 @@ impl RendezvousServer {
         } else if !self.check_ip_blocker(&ip, &id).await {
             return Err(TOO_FREQUENT);
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
+        }
+        match routing_auth::device_admission(&id, &rk.uuid, &rk.pk, true).await {
+            routing_auth::Admission::Allowed => {}
+            routing_auth::Admission::Pending => return Err(register_pk_response::Result::NOT_DEPLOYED),
+            routing_auth::Admission::Unavailable => return Err(register_pk_response::Result::SERVER_ERROR),
         }
         let peer = self.pm.get_or(&id).await;
         let (changed, ip_changed) = {
@@ -1045,15 +1091,19 @@ impl RendezvousServer {
             msg_out.set_punch_hole_response(denial);
             return Ok((msg_out, None));
         }
-        if !switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type)
-            && !routing_auth::connection_allowed(&ph.id, &ph.token, MUST_LOGIN.load(Ordering::SeqCst)).await {
+        let permissions = if switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type) {
+            Some(0)
+        } else {
+            routing_auth::connection_permissions(&ph.id, &ph.token, MUST_LOGIN.load(Ordering::SeqCst)).await
+        };
+        let Some(permissions) = permissions else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 other_failure: "Connection not authorized for this device".to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
-        }
+        };
         let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -1061,6 +1111,14 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
+            if !target_admitted(&id, &peer).await {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: "Device deployment is required".to_owned(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
@@ -1117,6 +1175,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    control_permissions: control_permissions(permissions),
                     ..Default::default()
                 });
             } else {
@@ -1130,6 +1189,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    control_permissions: control_permissions(permissions),
                     ..Default::default()
                 });
             }
