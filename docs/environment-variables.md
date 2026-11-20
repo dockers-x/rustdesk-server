@@ -283,3 +283,24 @@ permission. Signed target-bound Switch Sides grants retain their existing path.
 `MUST_LOGIN=N` retains legacy unauthenticated routing and does not enforce this
 ACL. Direct-IP traffic and already established sessions do not pass this check.
 Endpoint passwords/approval and network access controls remain necessary.
+
+## Device admission and control permissions (v0.2.48)
+
+Configure the same `RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN` on Console and
+each hbbs that should enforce device admission. Use a random secret of at least
+32 characters. Set `RUSTDESK_API_RUSTDESK_API_SERVER` on hbbs to the paired Console
+v0.2.48 API as described above. Console enables its device-admission switch
+after receiving an authenticated check-in from a paired hbbs.
+
+Admission starts disabled. When enabled, matched approved device keys and
+devices with a matching successful Console deployment can register. Operators
+can review pending public-key fingerprints in Console. Revoking a device
+blocks its next registration or new hbbs-coordinated connection. A paired
+hbbs fails closed for these paths while the admission service is unavailable.
+Existing sessions and direct-IP access follow the client's local settings.
+
+With `MUST_LOGIN=Y`, Console can apply per-account restrictions to keyboard
+and mouse, clipboard, and file transfer. hbbs attaches them to newly created
+punch, LAN and relay negotiation messages. Only desktop targets that consume
+the control-permissions field apply these restrictions. Android targets and
+the signed Switch Sides grant flow follow their existing behavior.
