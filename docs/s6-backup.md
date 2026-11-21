@@ -29,6 +29,7 @@ docker run --rm --network none --volumes-from "$container:ro" \
 备份完成后可重启原服务。`backup-source/config` 是暂存的配置副本，按密钥材料保管。整个归档中只保存上述固定文件。如有以下数据，请随同该备份保留独立副本及对应时间点。
 
 - Compose 文件、镜像引用、环境变量、Docker Secrets、TLS 证书、自定义配置引用文件及外部签名材料。
+- Console 的存储配置库 `/app/data/storage-profiles.json` 和 TOTP 加密密钥 `/app/data/totp.key`。请单独保存在受限位置，并在恢复时放回原路径。使用自定义路径时以 Console 配置为准。
 - 本地录屏文件及录屏目录的挂载信息。
 - 外部对象存储数据、版本和访问配置。数据库快照包含已登记的录屏元数据。
 
@@ -53,8 +54,9 @@ docker run --rm --network none \
 
 ## 将离线归档发送到多个远程目标
 
-整套归档完成后，可用同一镜像中的 Console 命令推送到 S3 和 WebDAV。
-将远程凭据放在独立文件，并在主配置中通过 `backup-config-file` 引用。
+整套归档完成后，可用同一镜像中的 Console 命令加密并推送到 S3 和 WebDAV。
+可复用 Console「系统设置 → 自动备份」中的存储配置项与 age 公钥。
+使用原有 YAML 时，将远程凭据与 `age-recipient` 放在独立文件中，并在主配置中通过 `backup-config-file` 引用。独立文件无需外层 `backup`。
 离线采集只读取主配置。执行上传时再挂载远程凭据文件。主配置和密钥保留在
 私有卷。远程目标须限制访问，因为整套归档含数据库和服务密钥。
 
@@ -62,6 +64,7 @@ docker run --rm --network none \
 /app/rustdesk-console -c /app/conf/config.yaml database upload-backup /backup/rustdesk-2026-11-21.tar --json
 ```
 
-命令独立上传每个目标并输出逐项结果。任何单项失败会使最终退出码为 4。
-可从宿主机在离线备份完成后定时调用。Console 诊断页的一键及间隔备份适用于
-运行中的 Console SQLite，可与这套 S6 离线流程共用目标配置。
+命令上传 `.tar.age` 密文并输出每个目标的结果。恢复前先通过
+`age --decrypt --identity identity.txt --output rustdesk.tar rustdesk.tar.age`
+解密，再使用前文的恢复步骤。私钥保存于 Console 和各远程目标之外。任何单项失败会使最终退出码为 4。
+可从宿主机在离线备份完成后定时调用。「系统设置 → 自动备份」中的立即和定时备份适用于运行中的 Console SQLite，可与 S6 离线流程共用目标配置。
