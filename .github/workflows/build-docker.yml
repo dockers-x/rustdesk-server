@@ -154,6 +154,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify S6 container startup and Docker health
+        if: matrix.job.name == 'amd64'
+        env:
+          SERVER_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --provenance=false \
+            --build-arg S6_ARCH=x86_64 --build-arg SERVER_BUILD_REVISION="$SERVER_REVISION" \
+            --load -t rustdesk-s6-smoke ./docker
+          container=$(docker run --detach --network none --env DISABLE_UPDATE_CHECK=Y rustdesk-s6-smoke)
+          trap 'docker rm -fv "$container" >/dev/null' EXIT
+          for _attempt in $(seq 1 30); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy ] &&
+              docker exec "$container" curl -fsS http://127.0.0.1:21114/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker inspect --format '{{json .State.Health}}' "$container"
+          docker logs "$container"
+          exit 1
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v7.2.0
         with:

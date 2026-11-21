@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run the S6 health script against actual HBBS and HBBR processes."""
+"""Exercise the HTTP diagnostics of actual HBBS and HBBR processes."""
 
 import contextlib
 import http.client
-import http.server
 import json
 import os
 from pathlib import Path
@@ -11,13 +10,10 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 
-ROOT = Path(__file__).resolve().parent.parent
 BINARIES = Path(sys.argv[1]).resolve()
-CONSOLE_BINARY = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 KEY = "daemon-health-test-credential"
 
 
@@ -84,55 +80,6 @@ def stop_process(process):
             process.wait(timeout=5)
 
 
-@contextlib.contextmanager
-def console(cwd):
-    if CONSOLE_BINARY:
-        port = reserve_ports(())
-        cwd.mkdir()
-        config = cwd / "config.yaml"
-        config.write_text(f'gin:\n  api-addr: "127.0.0.1:{port}"\n')
-        with (cwd / "console.log").open("w") as stdout:
-            process = subprocess.Popen([CONSOLE_BINARY, "-c", config], cwd=cwd, stdout=stdout, stderr=stdout)
-            try:
-                wait_until(lambda: status(port, "/health") == 200, "Console never became healthy")
-                yield port
-            finally:
-                stop_process(process)
-        return
-
-    class HealthHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200 if self.path == "/health" else 404)
-            self.end_headers()
-
-        def log_message(self, *_args):
-            pass
-
-    with http.server.HTTPServer(("127.0.0.1", 0), HealthHandler) as server:
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-        try:
-            yield server.server_port
-        finally:
-            server.shutdown()
-            thread.join()
-
-
-def healthcheck(env, component=None, detail=None):
-    result = subprocess.run(
-        ["sh", ROOT / "docker/rootfs/usr/bin/healthcheck.sh"],
-        env=os.environ | env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    assert result.returncode == (1 if component else 0), result.stderr
-    if component:
-        assert component in result.stderr, result.stderr
-    if detail:
-        assert detail in result.stderr, result.stderr
-
-
 def verify_json(path, component, events):
     lines = path.read_text().splitlines()
     records = [json.loads(line) for line in lines]
@@ -196,7 +143,6 @@ def main():
             "no_proxy": "",
         }
         hbbr_env = {"HBBR_HEALTH_PORT": str(hbbr_health), "LOG_FORMAT": "json"}
-        check_env = hbbs_env | hbbr_env | {"CONSOLE_ENABLED": "0"}
         with daemon("hbbs", hbbs_data, hbbs_port, hbbs_env):
             wait_until(lambda: status(hbbs_health, "/readyz") == 200, "HBBS never became ready")
             assert status(hbbs_health, "/livez") == 200
@@ -208,29 +154,16 @@ def main():
             with daemon("hbbr", hbbr_data, hbbr_port, hbbr_env):
                 wait_until(lambda: status(hbbr_health, "/livez") == 200, "HBBR never became live")
                 assert status(hbbr_health, "/readyz") == 503
-                healthcheck(check_env, "HBBR", "HTTP 503")
                 wait_until(lambda: release_fifo(fifo), "HBBR did not open the startup FIFO")
                 wait_until(lambda: status(hbbr_health, "/readyz") == 200, "HBBR never became ready")
-                healthcheck(check_env)
-                with console(workdir / "console") as port:
-                    console_env = check_env | {
-                        "CONSOLE_ENABLED": "1",
-                        "CONSOLE_HEALTH_PORT": "",
-                        "RUSTDESK_API_GIN_API_ADDR": f"127.0.0.1:{port}",
-                    }
-                    healthcheck(console_env)
-                    healthcheck(console_env | {"RUSTDESK_API_GIN_API_ADDR": "", "CONSOLE_HEALTH_PORT": str(port)})
-                healthcheck(console_env, "Console")
                 verify_update_proxy(proxy, False)
 
             verify_json(hbbr_data / "hbbr.log", "hbbr", ["health.listening", "service.ready"])
             assert status(hbbr_health, "/livez") is None
-            healthcheck(check_env, "HBBR")
             fifo.unlink()
 
             with daemon("hbbr", hbbr_data, hbbr_port, hbbr_env):
                 wait_until(lambda: status(hbbr_health, "/readyz") == 200, "HBBR did not recover")
-                healthcheck(check_env)
 
         records = verify_json(hbbs_data / "hbbs.log", "hbbs", ["health.listening", "service.ready", "update.disabled"])
         assert all(record["event"] != "update.check" for record in records)
@@ -250,7 +183,7 @@ def main():
             assert status(hbbr_health, "/livez") is None
         assert "Listening on tcp" in (hbbr_data / "hbbr.log").read_text()
 
-    print("Daemon health, S6 aggregate, logging, and update opt-out passed")
+    print("Daemon HTTP diagnostics, logging, and update opt-out passed")
 
 
 if __name__ == "__main__":

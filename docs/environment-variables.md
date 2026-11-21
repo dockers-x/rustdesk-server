@@ -145,18 +145,10 @@ a different protocol listener address.
   rebinding listeners. A stopped daemon cannot respond to either endpoint.
 
 The combined S6 image enables these on `21120` for HBBS and `21121` for HBBR.
-The container health check probes both `/readyz` endpoints and the embedded
-Console's `/health` endpoint in parallel. Console checks its own database
-connection. The health check reports the component name on failure.
-
-Set port overrides in the S6 container environment so the daemon and shell
-healthcheck use the same values. Keep the health ports in the container and
-leave them unpublished. If you change Console's port with
-`RUSTDESK_API_GIN_API_ADDR`, the healthcheck reads that port automatically.
-If the port is changed in a mounted Console config file, set
-`CONSOLE_HEALTH_PORT` to the same port and ensure the listener accepts IPv4
-loopback connections. Set `CONSOLE_ENABLED=0` to skip starting and probing the
-embedded Console when deploying Console separately.
+They are available for Console diagnostics and local monitoring. Keep the
+health ports unpublished. Docker health uses S6 to check the HBBS and HBBR
+services. For Console and its database, query the Console `/health` endpoint
+directly.
 
 ## Logging
 
@@ -223,7 +215,6 @@ by `hbbs`/`hbbr` directly:
 | Variable | Default | Description |
 |---|---|---|
 | `CONSOLE_ENABLED` | `1` | Set to `0` for separate Console deployments. |
-| `CONSOLE_HEALTH_PORT` | Console listen override or `21114` | Port the S6 healthcheck uses for Console. |
 | `RELAY` | `relay.example.com` | Passed to `hbbs` as `-r $RELAY` (your public address). |
 | `ENCRYPTED_ONLY` | `0` | `1` adds `-k _` to both servers. This is redundant for `hbbs`, whose default is `-`, and opts `hbbr` into key validation instead of its intentional empty default. |
 | `KEY_PUB` | *(unset)* | If set, written to `/data/id_ed25519.pub` on first start. |
