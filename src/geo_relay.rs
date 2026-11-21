@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use serde_derive::Serialize;
 use std::{fs::OpenOptions, io::Read, net::IpAddr, path::Path, sync::RwLock};
 
-use rules::{DbRequirements, RuleSet};
+use rules::{DbRequirements, RuleSet, Selection};
 
 const COUNTRY_MMDB: &str = "GeoLite2-Country.mmdb";
 const CITY_MMDB: &str = "GeoLite2-City.mmdb";
@@ -17,6 +17,7 @@ const MAX_MMDB_BYTES: u64 = 256 * 1024 * 1024;
 static STATE: Lazy<RwLock<GeoState>> = Lazy::new(|| RwLock::new(GeoState::disabled()));
 
 struct GeoState {
+    revision: u64,
     enabled: bool,
     readers: GeoReaders,
     rules: RuleSet,
@@ -26,10 +27,48 @@ struct GeoState {
 impl GeoState {
     fn disabled() -> Self {
         Self {
+            revision: 0,
             enabled: false,
             readers: GeoReaders::default(),
             rules: RuleSet::empty(),
             warnings: Vec::new(),
+        }
+    }
+
+    fn select(&self, a: IpAddr, b: IpAddr, eligible_relays: &[String]) -> Option<Selection> {
+        if !self.enabled || eligible_relays.is_empty() {
+            return None;
+        }
+        self.rules.select(
+            &self.readers.lookup(a),
+            &self.readers.lookup(b),
+            eligible_relays,
+        )
+    }
+
+    fn preview(&self, a: IpAddr, b: IpAddr, eligible_relays: &[String]) -> GeoPreview {
+        let selection = self.select(a, b, eligible_relays);
+        let reason = if eligible_relays.is_empty() {
+            PreviewReason::NoRelay
+        } else if selection.is_some() {
+            PreviewReason::RuleMatch
+        } else if !self.enabled {
+            PreviewReason::Disabled
+        } else {
+            PreviewReason::NoEligibleMatch
+        };
+        let (relay, rule) = match selection {
+            Some(selection) => (Some(selection.relay), Some(selection.rule_name)),
+            None if eligible_relays.len() == 1 => (eligible_relays.first().cloned(), None),
+            None => (None, None),
+        };
+        GeoPreview {
+            revision: self.revision,
+            reason,
+            relay,
+            rule,
+            candidates: eligible_relays.to_vec(),
+            warnings: self.warnings.clone(),
         }
     }
 }
@@ -146,6 +185,7 @@ pub fn reload() -> String {
             );
         }
         state.enabled = false;
+        state.revision = config.revision;
         state.rules = RuleSet::empty();
         state.warnings.clear();
         return "Geo relay disabled by runtime config; using upstream relay selection".to_owned();
@@ -182,6 +222,7 @@ pub fn reload() -> String {
     );
     warnings.extend(state.readers.missing_requirements(rules.requirements()));
     state.enabled = true;
+    state.revision = config.revision;
     state.rules = rules;
     state.warnings = warnings;
     let databases = state.readers.loaded_names();
@@ -202,19 +243,38 @@ pub fn reload() -> String {
 
 pub fn select_relay(pa: IpAddr, pb: IpAddr, eligible_relays: &[String]) -> Option<String> {
     let state = STATE.read().ok()?;
-    if !state.enabled || eligible_relays.is_empty() {
-        return None;
-    }
-
-    let facts_a = state.readers.lookup(pa);
-    let facts_b = state.readers.lookup(pb);
-    let selection = state.rules.select(&facts_a, &facts_b, eligible_relays)?;
+    let selection = state.select(pa, pb, eligible_relays)?;
     log::debug!(
         "Geo relay selected {} by rule '{}'",
         selection.relay,
         selection.rule_name
     );
     Some(selection.relay)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PreviewReason {
+    RuleMatch,
+    Disabled,
+    NoEligibleMatch,
+    NoRelay,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoPreview {
+    revision: u64,
+    reason: PreviewReason,
+    relay: Option<String>,
+    rule: Option<String>,
+    candidates: Vec<String>,
+    warnings: Vec<String>,
+}
+
+pub(crate) fn preview(a: IpAddr, b: IpAddr, eligible_relays: &[String]) -> Result<String, String> {
+    let state = STATE.read().map_err(|_| "Geo relay state lock failed")?;
+    serde_json::to_string(&state.preview(a, b, eligible_relays)).map_err(|err| err.to_string())
 }
 
 impl GeoReaders {
@@ -343,14 +403,11 @@ struct GeoStatus {
 }
 
 pub fn status() -> String {
-    let revision = runtime_config::snapshot()
-        .map(|config| config.revision)
-        .unwrap_or_default();
     let Ok(state) = STATE.read() else {
         return r#"{"error":"Geo relay state lock failed"}"#.to_owned();
     };
     let status = GeoStatus {
-        revision,
+        revision: state.revision,
         enabled: state.enabled,
         rule_count: state.rules.len(),
         country_available: state.readers.country.is_some(),
@@ -442,6 +499,48 @@ fn set_if_empty(target: &mut Option<String>, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_uses_the_runtime_rule_order_and_reports_fallback() {
+        let mut state = super::GeoState::disabled();
+        let config = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "rules": [
+                {"name": "unavailable", "match": {}, "relays": ["offline:21117"]},
+                {"name": "regional", "match": {}, "relays": ["secondary:21117", "primary:21117"]}
+            ]
+        }))
+        .expect("valid Geo rules");
+        state.rules = super::RuleSet::compile(&config).expect("compiled Geo rules");
+        state.revision = 24;
+        state.enabled = true;
+
+        let a = std::net::Ipv4Addr::new(192, 0, 2, 1).into();
+        let b = std::net::Ipv6Addr::LOCALHOST.into();
+        let eligible = ["primary:21117".to_owned(), "secondary:21117".to_owned()];
+        let selection = state.select(a, b, &eligible).expect("eligible rule");
+        let preview = state.preview(a, b, &eligible);
+        assert!(matches!(preview.reason, super::PreviewReason::RuleMatch));
+        assert_eq!(preview.revision, 24);
+        assert_eq!(preview.rule.as_deref(), Some("regional"));
+        assert_eq!(preview.relay.as_deref(), Some("secondary:21117"));
+        assert_eq!(preview.relay.as_deref(), Some(selection.relay.as_str()));
+
+        let fallback = state.preview(a, b, &["other:21117".to_owned()]);
+        assert!(matches!(fallback.reason, super::PreviewReason::NoEligibleMatch));
+        assert_eq!(fallback.relay.as_deref(), Some("other:21117"));
+        assert!(fallback.rule.is_none());
+
+        state.enabled = false;
+        let rotation = state.preview(a, b, &eligible);
+        assert!(matches!(rotation.reason, super::PreviewReason::Disabled));
+        assert!(rotation.relay.is_none());
+        assert_eq!(rotation.candidates, eligible);
+        assert!(matches!(
+            state.preview(a, b, &[]).reason,
+            super::PreviewReason::NoRelay
+        ));
+    }
+
     use super::*;
 
     #[test]

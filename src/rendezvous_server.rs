@@ -1358,7 +1358,7 @@ impl RendezvousServer {
             }
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "apply-geo-config(agc) <basename> <length> <sha256>",
                     "reload-geo(rg)",
@@ -1368,6 +1368,7 @@ impl RendezvousServer {
                     "punch-requests(pr) [<number>] [-]",
                     "always-use-relay(aur) [Y|N]",
                     "test-geo(tg) <ip1> <ip2>",
+                    "geo-preview <ip1> <ip2>",
                     "must-login(ml) [Y|N]",
                 )
             }
@@ -1400,6 +1401,17 @@ impl RendezvousServer {
             }
             Some("geo-status" | "gs") => {
                 res = geo_relay::status();
+            }
+            Some("geo-preview") => {
+                let a = fds.next().and_then(|value| value.parse::<IpAddr>().ok());
+                let b = fds.next().and_then(|value| value.parse::<IpAddr>().ok());
+                return match (a, b, fds.next()) {
+                    (Some(a), Some(b), None) => {
+                        geo_relay::preview(a, b, self.relay_servers.as_ref())
+                            .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string())
+                    }
+                    _ => r#"{"error":"Expected two IP addresses"}"#.to_owned(),
+                };
             }
             Some("relay-servers" | "rs") => {
                 if let Some(rs) = fds.next() {
