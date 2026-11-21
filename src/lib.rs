@@ -2,6 +2,8 @@ mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod common;
 mod database;
+pub mod health;
+pub mod logging;
 mod geo_relay;
 mod peer;
 mod runtime_config;

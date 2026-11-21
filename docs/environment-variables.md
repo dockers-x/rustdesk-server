@@ -28,9 +28,8 @@ three ways to set the same thing.
 For **`hbbr`** the precedence is: **flag** (`-b`, `-p`, `-k`) → **`.env`** →
 **inherited environment**.
 
-`RUST_LOG` is an exception to these rules. Both binaries initialize logging
-before loading `.env` (or `hbbs`'s `--config` file), so `RUST_LOG` must be set
-in the inherited process environment.
+`RUST_LOG` and `LOG_FORMAT` are read from the inherited process environment.
+Both binaries initialize logging before loading `.env` or the HBBS config file.
 
 ---
 
@@ -132,6 +131,33 @@ directory.
 
 ---
 
+## Health probes
+
+Set `HBBS_HEALTH_PORT` and `HBBR_HEALTH_PORT` to enable one HTTP listener per
+daemon. Standalone binaries leave the endpoint disabled when its setting is unset,
+empty or `0`. Each health listener binds to `127.0.0.1` even if the daemon uses
+a different protocol listener address.
+
+- `GET /livez` returns HTTP 200 once the local HTTP listener can answer.
+- `GET /readyz` returns HTTP 200 after the daemon initializes its protocol
+  listeners and services a probe from its main I/O loop. It returns HTTP 503 if
+  the loop cannot respond within 500 ms, including while initializing or
+  rebinding listeners. A stopped daemon cannot respond to either endpoint.
+
+The combined S6 image enables these on `21120` for HBBS and `21121` for HBBR.
+The container health check probes both `/readyz` endpoints and the embedded
+Console's `/health` endpoint in parallel. Console checks its own database
+connection. The health check reports the component name on failure.
+
+Set port overrides in the S6 container environment so the daemon and shell
+healthcheck use the same values. Keep the health ports in the container and
+leave them unpublished. If you change Console's port with
+`RUSTDESK_API_GIN_API_ADDR`, the healthcheck reads that port automatically.
+If the port is changed in a mounted Console config file, set
+`CONSOLE_HEALTH_PORT` to the same port and ensure the listener accepts IPv4
+loopback connections. Set `CONSOLE_ENABLED=0` to skip starting and probing the
+embedded Console when deploying Console separately.
+
 ## Logging
 
 Both binaries use `flexi_logger`, which honours the standard **`RUST_LOG`**
@@ -140,8 +166,19 @@ before launching the binary. A value in `.env` or `hbbs`'s `--config` file is
 loaded too late and has no effect on logging.
 
 ```bash
-RUST_LOG=debug hbbs
+RUST_LOG=debug LOG_FORMAT=json hbbs
 ```
+
+The default output is text. `LOG_FORMAT=json` emits a JSON record per line
+with UTC timestamp, level, component, event, and source location. Static log
+messages are included where available. The formatter omits interpolated
+values, including credentials, peer data and protocol frames. `RUST_LOG`
+controls the level in both formats.
+
+## Official version checks
+
+HBBS normally checks the official RustDesk version service at startup and
+once per day. Set `DISABLE_UPDATE_CHECK=Y` to skip starting the check task.
 
 ---
 
@@ -167,7 +204,8 @@ key-pair setup and mismatch failures. Leave it empty for the default mode
 without key validation. To enable relay key validation, give it the same
 non-empty key as `hbbs`; both services can reuse key material from a shared
 working directory. The `_` value is not a stricter mode than `-` in the current
-implementation.
+implementation. The client and transport test matrix is in the
+[KX v1 compatibility investigation](kx-v1-compatibility.md).
 
 To supply your own key pair, place `id_ed25519` and `id_ed25519.pub` in the
 process's **current working directory** before first start. That directory may
@@ -184,6 +222,8 @@ by `hbbs`/`hbbr` directly:
 
 | Variable | Default | Description |
 |---|---|---|
+| `CONSOLE_ENABLED` | `1` | Set to `0` for separate Console deployments. |
+| `CONSOLE_HEALTH_PORT` | Console listen override or `21114` | Port the S6 healthcheck uses for Console. |
 | `RELAY` | `relay.example.com` | Passed to `hbbs` as `-r $RELAY` (your public address). |
 | `ENCRYPTED_ONLY` | `0` | `1` adds `-k _` to both servers. This is redundant for `hbbs`, whose default is `-`, and opts `hbbr` into key validation instead of its intentional empty default. |
 | `KEY_PUB` | *(unset)* | If set, written to `/data/id_ed25519.pub` on first start. |

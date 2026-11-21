@@ -65,6 +65,38 @@ jobs:
             target/${{ matrix.job.target }}/release/rustdesk-utils
           if-no-files-found: error
 
+  release-archives:
+    name: Publish Linux archives and checksums
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: binaries-linux-*
+          path: binaries
+      - name: Package and verify
+        run: |
+          set -euo pipefail
+          mkdir release
+          for arch in amd64 arm64v8 armv7; do
+            dir="binaries/binaries-linux-$arch"
+            chmod a+x "$dir"/hbbs "$dir"/hbbr "$dir"/rustdesk-utils
+            tar -czf "release/rustdesk-server-linux-$arch.tar.gz" -C "$dir" hbbs hbbr rustdesk-utils
+          done
+          cd release
+          sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+
   docker-s6:
     name: Docker s6 - ${{ matrix.job.name }}
     needs: build-linux
@@ -131,6 +163,7 @@ jobs:
           provenance: false
           build-args: |
             S6_ARCH=${{ matrix.job.s6_platform }}
+            SERVER_BUILD_REVISION=${{ github.sha }}
           tags: |
             ${{ env.DOCKERHUB_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
             ${{ env.DOCKERHUB_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}

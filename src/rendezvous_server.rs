@@ -1,4 +1,4 @@
-use crate::common::*;
+use crate::{common::*, health::Health};
 use crate::{geo_relay, routing_auth, runtime_config, switch_grant, transport_hints};
 use crate::peer::*;
 use hbb_common::bytes::BufMut;
@@ -250,6 +250,7 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
     ) -> ResultType<()> {
+        let mut health = Health::bind("HBBS_HEALTH_PORT", &get_arg("HBBS_HEALTH_PORT")).await?;
         let (key, sk) = Self::get_server_sk(key)?;
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -369,7 +370,7 @@ impl RendezvousServer {
         };
         let main_task = async move {
             loop {
-                log::info!("Start");
+                log::info!(target: "service.ready", "Start");
                 match rs
                     .io_loop(
                         &mut rx,
@@ -379,6 +380,7 @@ impl RendezvousServer {
                         &mut listener_console,
                         &mut socket,
                         &key,
+                        &mut health,
                     )
                     .await
                 {
@@ -421,11 +423,13 @@ impl RendezvousServer {
         listener_console: &mut Option<TcpListener>,
         socket: &mut FramedSocket,
         key: &str,
+        health: &mut Health,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
         let mut timer_admission = interval(Duration::from_secs(15));
         loop {
             tokio::select! {
+                probe = health.next_probe() => { let _ = probe.send(()); }
                 _ = timer_admission.tick(), if routing_auth::uses_device_admission() => {
                     tokio::spawn(routing_auth::refresh_admission_pairing());
                 }

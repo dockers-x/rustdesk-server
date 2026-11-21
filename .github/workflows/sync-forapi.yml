@@ -2,6 +2,11 @@ name: Sync upstream
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Official rustdesk/rustdesk-server release tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,7 +19,7 @@ jobs:
   sync:
     name: Merge official upstream
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Check out forapi
@@ -29,10 +34,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libclang-dev pkg-config
+
       - name: Sync with upstream
         env:
           UPSTREAM_URL: https://github.com/rustdesk/rustdesk-server.git
-        run: ./scripts/sync-forapi.sh
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: ./scripts/sync-forapi.sh "$UPSTREAM_TAG"
 
       - name: Report conflict guidance
         if: failure()

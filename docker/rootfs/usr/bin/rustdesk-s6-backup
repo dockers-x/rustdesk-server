@@ -1,0 +1,191 @@
+#!/bin/sh
+set -eu
+umask 077
+export LC_ALL=C
+PATH="/app:$PATH"
+export PATH
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    fail 'Usage:
+  rustdesk-s6-backup backup --offline ARCHIVE [HBBS_DIR CONSOLE_DATA_DIR CONSOLE_CONFIG_DIR]
+  rustdesk-s6-backup restore --offline ARCHIVE NEW_DIRECTORY
+Stop every writer before use. Default source directories: /data /app/data /app/conf.'
+}
+
+[ "${2-}" = --offline ] || usage
+[ ! -d /run/s6-rc/servicedirs ] || fail 'Use a separate container after stopping the deployment.'
+operation="$1"
+shift 2
+
+scratch=
+cleanup() {
+    if [ -n "$scratch" ]; then
+        rm -rf -- "$scratch"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+required_members='server/db_v2.sqlite3
+server/id_ed25519
+server/id_ed25519.pub
+console/rustdeskapi.db
+config/config.yaml'
+
+require_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "Expected a regular file: $1"
+}
+
+sqlite_readonly() {
+    sqlite3 -batch -bail -init /dev/null -readonly "$@"
+}
+
+check_database() {
+    result="$(sqlite_readonly "$1" 'PRAGMA quick_check;')"
+    [ "$result" = ok ] || fail "SQLite integrity check failed: $1"
+}
+
+copy_database() {
+    # Stage persistent SQLite state so read-only volume mounts work even when
+    # recovery or WAL access needs to create or update a sidecar.
+    stage="$scratch/sqlite-source"
+    mkdir -- "$stage"
+    cat -- "$1" > "$stage/source.db"
+    for suffix in -wal -journal; do
+        if [ -e "$1$suffix" ] || [ -L "$1$suffix" ]; then
+            require_file "$1$suffix"
+            cat -- "$1$suffix" > "$stage/source.db$suffix"
+        fi
+    done
+    # The destination is a fixed path relative to the private working directory.
+    sqlite3 -batch -bail -init /dev/null -cmd '.timeout 5000' "$stage/source.db" ".backup $2"
+    check_database "$2"
+    rm -rf -- "$stage"
+}
+
+write_checksums() {
+    for member in "$@"; do
+        sha256sum -- "$member" || return 1
+    done
+}
+
+case "$operation" in
+    backup)
+        [ "$#" -eq 1 ] || [ "$#" -eq 4 ] || usage
+        archive="$(realpath -m -- "$1")"
+        [ ! -e "$1" ] && [ ! -L "$1" ] || fail 'The archive path already exists.'
+        server_dir="$(realpath -e -- "${2-/data}")"
+        console_dir="$(realpath -e -- "${3-/app/data}")"
+        config_dir="$(realpath -e -- "${4-/app/conf}")"
+        require_file "$config_dir/config.yaml"
+        if env | grep -Eiq '^db[-_]url='; then
+            fail 'Custom HBBS DB_URL is outside the standard S6 backup layout.'
+        fi
+        if [ -e "$server_dir/.env" ] || [ -L "$server_dir/.env" ]; then
+            require_file "$server_dir/.env"
+            if grep -Eiq '^[[:space:]]*db[-_]url[[:space:]]*[:=]' "$server_dir/.env"; then
+                fail 'Custom HBBS DB_URL is outside the standard S6 backup layout.'
+            fi
+        fi
+        # Capture keeps the main YAML, but does not read separately mounted remote credentials.
+        config="$(RUSTDESK_API_BACKUP_CONFIG_FILE='' rustdesk-console --config "$config_dir/config.yaml" config validate --json)" \
+            || fail 'Could not validate the Console configuration.'
+        printf '%s\n' "$config" | grep -Fq '"database_type":"sqlite"' \
+            || fail 'Use the native backup utility for the configured Console database backend.'
+        for source in "$server_dir/db_v2.sqlite3" "$server_dir/id_ed25519" \
+            "$server_dir/id_ed25519.pub" "$console_dir/rustdeskapi.db"; do
+            require_file "$source"
+        done
+
+        scratch="$(mktemp -d -- "$(dirname -- "$archive")/.rustdesk-backup.XXXXXXXX")"
+        cd "$scratch"
+        mkdir -p server console config/features
+        copy_database "$server_dir/db_v2.sqlite3" server/db_v2.sqlite3
+        copy_database "$console_dir/rustdeskapi.db" console/rustdeskapi.db
+        cat -- "$server_dir/id_ed25519" > server/id_ed25519
+        cat -- "$server_dir/id_ed25519.pub" > server/id_ed25519.pub
+        cat -- "$config_dir/config.yaml" > config/config.yaml
+        members="$required_members"
+        if [ -e "$server_dir/.env" ]; then
+            cat -- "$server_dir/.env" > server/.env
+            members="$members
+server/.env"
+        fi
+        feature="$config_dir/features/self-signed-client.json"
+        if [ -e "$feature" ] || [ -L "$feature" ]; then
+            require_file "$feature"
+            cat -- "$feature" > config/features/self-signed-client.json
+            members="$members
+config/features/self-signed-client.json"
+        fi
+        console_schema="$(sqlite_readonly console/rustdeskapi.db 'SELECT MAX(version) FROM versions;')"
+        case "$console_schema" in
+            ''|*[!0-9]*) fail 'Console schema version is missing or invalid.' ;;
+        esac
+        hbbs_schema="$(sqlite_readonly server/db_v2.sqlite3 'PRAGMA user_version;')"
+        console_version="$(rustdesk-console --version)"
+        hbbs_version="$(hbbs --version)"
+        cat > manifest.txt <<EOF
+format=rustdesk-s6-sqlite-v1
+created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+console_version=$console_version
+console_schema=$console_schema
+hbbs_version=$hbbs_version
+hbbs_user_version=$hbbs_schema
+EOF
+        # Filenames are fixed above and contain no whitespace or glob metacharacters.
+        # shellcheck disable=SC2086
+        write_checksums manifest.txt $members > SHA256SUMS
+        # shellcheck disable=SC2086
+        tar --create --file=bundle.tar -- manifest.txt SHA256SUMS $members
+        sync bundle.tar
+        ln -T -- bundle.tar "$archive"
+        printf 'S6 backup written to %s\n' "$archive"
+        ;;
+    restore)
+        [ "$#" -eq 2 ] || usage
+        require_file "$1"
+        archive="$(realpath -e -- "$1")"
+        destination="$(realpath -m -- "$2")"
+        [ ! -e "$2" ] && [ ! -L "$2" ] || fail 'The restore directory already exists.'
+        members="manifest.txt
+SHA256SUMS
+$required_members"
+        archive_members="$(tar --list --force-local --file="$archive")"
+        case "$archive_members" in
+            "$members"|"$members
+server/.env"|"$members
+config/features/self-signed-client.json"|"$members
+server/.env
+config/features/self-signed-client.json") ;;
+            *) fail 'Unexpected members in the S6 backup archive.' ;;
+        esac
+        mkdir -- "$destination"
+        scratch="$destination"
+        cd "$destination"
+        mkdir -p server console config/features
+        # The member list has been matched against the fixed layout.
+        for member in $archive_members; do
+            tar --extract --to-stdout --occurrence=1 --force-local --file="$archive" -- "$member" > "$destination/$member"
+        done
+        IFS= read -r format < manifest.txt
+        [ "$format" = format=rustdesk-s6-sqlite-v1 ] || fail 'Unsupported S6 backup format.'
+        # Recompute the manifest and compare it without trusting paths inside SHA256SUMS.
+        # shellcheck disable=SC2086
+        set -- $archive_members
+        shift 2
+        write_checksums manifest.txt "$@" > .checksums
+        cmp -s -- SHA256SUMS .checksums || fail 'S6 backup checksum verification failed.'
+        rm -- .checksums
+        check_database server/db_v2.sqlite3
+        check_database console/rustdeskapi.db
+        scratch=
+        printf 'Verified S6 backup restored to %s\n' "$destination"
+        ;;
+    *) usage ;;
+esac

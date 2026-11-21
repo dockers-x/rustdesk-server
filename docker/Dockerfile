@@ -1,12 +1,15 @@
-FROM czyt/rustdesk-console:v0.2.51@sha256:2762c3571520fc2a30623d85acbf5ad66ece2ade0fbf01aa3e9a4f19edd2a314
+FROM czyt/rustdesk-console:v0.2.52@sha256:8127f83a0fde79805f40c5a32b9a8ea28a09a8e6c2faed91192d414e0e428ab7
 
 ARG S6_OVERLAY_VERSION=3.2.0.0
 ARG S6_ARCH=x86_64
+ARG SERVER_BUILD_REVISION=unknown
+LABEL org.opencontainers.image.revision="$SERVER_BUILD_REVISION"
+LABEL org.opencontainers.image.source="https://github.com/dockers-x/rustdesk-server"
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz /tmp
 RUN \
   apt-get update && \
-  apt-get install -y --no-install-recommends xz-utils && \
+  apt-get install -y --no-install-recommends curl sqlite3 xz-utils && \
   rm -rf /var/lib/apt/lists/* && \
   tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz && \
   tar -C / -Jxpf /tmp/s6-overlay-${S6_ARCH}.tar.xz && \
@@ -17,6 +20,8 @@ COPY rootfs /
 
 ENV RELAY=relay.example.com
 ENV ENCRYPTED_ONLY=0
+ENV HBBS_HEALTH_PORT=21120
+ENV HBBR_HEALTH_PORT=21121
 
 EXPOSE 21114 21115 21116 21116/udp 21117 21118 21119
 

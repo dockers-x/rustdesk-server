@@ -1,6 +1,8 @@
 #!/command/with-contenv sh
 sleep 2
-cd /data
-PARAMS=
-[ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
-/usr/bin/hbbs -r $RELAY $PARAMS
+cd /data || exit 1
+set --
+if [ "${ENCRYPTED_ONLY}" = 1 ]; then
+    set -- -k _
+fi
+exec /usr/bin/hbbs -r "$RELAY" "$@"

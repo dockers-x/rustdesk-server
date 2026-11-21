@@ -1,4 +1,7 @@
 #!/command/with-contenv sh
+if [ "${CONSOLE_ENABLED:-1}" = 0 ]; then
+    exec sleep infinity
+fi
 sleep 3
-cd /app
-./rustdesk-console -c ./conf/config.yaml
+cd /app || exit 1
+exec ./rustdesk-console -c ./conf/config.yaml

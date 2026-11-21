@@ -1,5 +1,7 @@
 #!/command/with-contenv sh
-cd /data
-PARAMS=
-[ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
-/usr/bin/hbbr $PARAMS
+cd /data || exit 1
+set --
+if [ "${ENCRYPTED_ONLY}" = 1 ]; then
+    set -- -k _
+fi
+exec /usr/bin/hbbr "$@"

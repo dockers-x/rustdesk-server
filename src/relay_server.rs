@@ -1,5 +1,6 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
+use hbbs::health::Health;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -61,6 +62,8 @@ pub async fn start_with_bind(
     port: &str,
     key: &str,
 ) -> ResultType<()> {
+    let mut health =
+        Health::bind("HBBR_HEALTH_PORT", &crate::common::get_arg("HBBR_HEALTH_PORT")).await?;
     let key = get_server_sk(key)?;
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
@@ -98,12 +101,12 @@ pub async fn start_with_bind(
     log::info!("Listening on websocket :{}", port2);
     let main_task = async move {
         loop {
-            log::info!("Start");
             io_loop(
                 crate::common::listen_tcp(bind_addr, port).await?,
                 crate::common::listen_tcp(bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
                 &key,
+                &mut health,
             )
             .await;
         }
@@ -348,11 +351,14 @@ async fn io_loop(
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
     key: &str,
+    health: &mut Health,
 ) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    log::info!(target: "service.ready", "Start");
     loop {
         tokio::select! {
+            probe = health.next_probe() => { let _ = probe.send(()); }
             res = listener.accept() => {
                 match res {
                     Ok((stream, addr))  => {

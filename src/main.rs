@@ -1,18 +1,13 @@
 // https://tools.ietf.org/rfc/rfc5128.txt
 // https://blog.csdn.net/bytxl/article/details/44344855
 
-use flexi_logger::*;
 use hbb_common::{bail, config::RENDEZVOUS_PORT, ResultType};
 use hbbs::{common::*, *};
 
 const RMEM: usize = 0;
 
 fn main() -> ResultType<()> {
-    let _logger = Logger::try_with_env_or_str("info")?
-        .log_to_stdout()
-        .format(opt_format)
-        .write_mode(WriteMode::Async)
-        .start()?;
+    let _logger = logging::start("hbbs")?;
     let args = format!(
         "-c --config=[FILE] +takes_value 'Sets a custom config file'
         -b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'

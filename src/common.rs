@@ -426,9 +426,16 @@ pub async fn listen_signal() -> Result<()> {
 
 
 pub fn check_software_update() {
+    if get_arg("DISABLE_UPDATE_CHECK").trim().eq_ignore_ascii_case("Y") {
+        log::info!(target: "update.disabled", "Official server update check disabled");
+        return;
+    }
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
     std::thread::spawn(move || loop {
-        std::thread::spawn(move || allow_err!(check_software_update_()));
+        std::thread::spawn(move || {
+            log::debug!(target: "update.check", "Checking for an official server update");
+            allow_err!(check_software_update_());
+        });
         std::thread::sleep(std::time::Duration::from_secs(ONE_DAY_IN_SECONDS));
     });
 }
