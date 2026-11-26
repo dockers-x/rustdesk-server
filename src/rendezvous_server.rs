@@ -31,7 +31,7 @@ use hbb_common::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex},
+        sync::{mpsc, watch, Mutex},
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
@@ -46,8 +46,8 @@ use std::io::Error;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, Weak},
     time::Instant,
 };
 
@@ -60,6 +60,7 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -67,30 +68,112 @@ struct SafeWsSink {
     encrypt: Option<Encrypt>,
 }
 
+struct WsWriter {
+    state: Mutex<SafeWsSink>,
+    closed: watch::Sender<bool>,
+}
+
+impl WsWriter {
+    fn new(sink: WsSink) -> Self {
+        Self {
+            state: Mutex::new(SafeWsSink { sink, encrypt: None }),
+            closed: watch::channel(false).0,
+        }
+    }
+
+    fn close(&self) {
+        self.closed.send_replace(true);
+    }
+
+    async fn send(&self, message: &RendezvousMessage) -> ResultType<()> {
+        let mut bytes = message.write_to_bytes()?;
+        let deadline = tokio::time::Instant::now() + WS_WRITE_TIMEOUT;
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock()).await?;
+        let mut closed = self.closed.subscribe();
+        let closed_error = || Error::new(std::io::ErrorKind::BrokenPipe, "WebSocket writer closed");
+        if *closed.borrow_and_update() {
+            return Err(closed_error().into());
+        }
+        if let Some(key) = state.encrypt.as_mut() {
+            bytes = key.enc(&bytes);
+        }
+        let frame = tungstenite::Message::Binary(bytes.into());
+        let result: ResultType<()> = tokio::select! {
+            biased;
+            _ = closed.changed() => return Err(closed_error().into()),
+            write = tokio::time::timeout_at(deadline, state.sink.send(frame)) => match write {
+                Ok(result) => result.map_err(Into::into),
+                Err(error) => Err(error.into()),
+            },
+        };
+        if result.is_err() {
+            // A canceled write may have queued a frame and advanced encryption.
+            self.close();
+        }
+        result
+    }
+}
+
+#[derive(Default)]
+struct WsWriters(Mutex<HashMap<SocketAddr, Weak<WsWriter>>>);
+
+impl WsWriters {
+    async fn insert(&self, addr: SocketAddr, writer: Weak<WsWriter>) {
+        self.0.lock().await.insert(try_into_v4(addr), writer);
+    }
+
+    async fn get(&self, addr: SocketAddr) -> Option<Arc<WsWriter>> {
+        let addr = try_into_v4(addr);
+        let mut writers = self.0.lock().await;
+        let writer = writers.get(&addr)?.upgrade();
+        if writer.is_none() {
+            writers.remove(&addr);
+        }
+        writer
+    }
+
+    async fn remove(&self, addr: SocketAddr, expected: &Weak<WsWriter>) {
+        let addr = try_into_v4(addr);
+        let mut writers = self.0.lock().await;
+        if writers
+            .get(&addr)
+            .is_some_and(|current| current.ptr_eq(expected))
+        {
+            writers.remove(&addr);
+        }
+    }
+}
+
 struct SafeTcpStreamSink {
     sink: TcpStreamSink,
     encrypt: Option<Encrypt>,
+    generation: u64,
 }
 enum Sink {
     // TcpStream(TcpStreamSink),
     // Ws(WsSink),
-    Wss(SafeWsSink),
+    // The WebSocket reader owns the writer, even while a punch reply is pending.
+    Wss(Weak<WsWriter>),
     Tss(SafeTcpStreamSink),
 }
 
 impl Sink {
+    fn for_punch(sink: &mut Option<Self>) -> Option<Self> {
+        match sink {
+            Some(Self::Wss(writer)) => Some(Self::Wss(writer.clone())),
+            _ => sink.take(),
+        }
+    }
+
     async fn send(&mut self, msg: &RendezvousMessage) {
-        if let Ok(mut bytes) = msg.write_to_bytes() {
-            match self {
-                // Sink::TcpStream(mut s) => allow_err!(s.send(Bytes::from(bytes)).await),
-                // Sink::Ws(mut s) => allow_err!(s.send(tungstenite::Message::Binary(bytes)).await),
-                Sink::Wss(s) => {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        bytes = key.enc(&bytes);
-                    }
-                    allow_err!(s.sink.send(tungstenite::Message::Binary(bytes.into())).await)
+        match self {
+            Sink::Wss(writer) => {
+                if let Some(writer) = writer.upgrade() {
+                    allow_err!(writer.send(msg).await);
                 }
-                Sink::Tss(s) => {
+            }
+            Sink::Tss(s) => {
+                if let Ok(mut bytes) = msg.write_to_bytes() {
                     if let Some(key) = s.encrypt.as_mut() {
                         bytes = key.enc(&bytes);
                     }
@@ -100,8 +183,21 @@ impl Sink {
         }
     }
 }
+
+fn remove_tcp_punch(
+    pending: &mut HashMap<SocketAddr, Sink>,
+    addr: SocketAddr,
+    generation: u64,
+) {
+    let addr = try_into_v4(addr);
+    if matches!(pending.get(&addr), Some(Sink::Tss(current)) if current.generation == generation) {
+        pending.remove(&addr);
+    }
+}
+
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
+static NEXT_TCP_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
@@ -253,7 +349,7 @@ pub struct RendezvousServer {
     relay_generation: u64,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    ws_map: Arc<WsWriters>,
 }
 
 enum LoopFailure {
@@ -322,7 +418,7 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
-            ws_map: Arc::new(Mutex::new(HashMap::new())),
+            ws_map: Arc::default(),
             guest_relays: Arc::new(Mutex::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -703,7 +799,7 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
+                    if let Some(sink) = Sink::for_punch(sink) {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws, local_websocket).await);
@@ -765,7 +861,7 @@ impl RendezvousServer {
                             Self::send_to_sink(sink, blocked_relay_response()).await;
                             return true;
                         }
-                        if let Some(sink) = sink.take() {
+                        if let Some(sink) = Sink::for_punch(sink) {
                             self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                         }
                         let mut msg_out = RendezvousMessage::new();
@@ -873,12 +969,17 @@ impl RendezvousServer {
                                 result: res.into(),
                                 ..Default::default()
                             });
-                            Self::send_to_sink(sink, msg_out).await;
-                            if ws {
-                                // for ws, we can only get addr when register_pk
-                                if let Some(sink) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), sink);
+                            if let Some(Sink::Wss(writer)) = sink.as_ref() {
+                                let Some(active) = writer.upgrade() else {
+                                    return false;
+                                };
+                                if let Err(error) = active.send(&msg_out).await {
+                                    log::debug!("WebSocket registration reply to {addr} failed: {error}");
+                                    return false;
                                 }
+                                self.ws_map.insert(addr, Arc::downgrade(&active)).await;
+                            } else {
+                                Self::send_to_sink(sink, msg_out).await;
                             }
                             return true;
                         }
@@ -900,7 +1001,11 @@ impl RendezvousServer {
                         Ok(key) => {
                             if let Some(sink) = sink.as_mut() {
                                 match sink {
-                                    Sink::Wss(s) => s.encrypt = Some(Encrypt::new(key)),
+                                    Sink::Wss(writer) => {
+                                        if let Some(writer) = writer.upgrade() {
+                                            writer.state.lock().await.encrypt = Some(Encrypt::new(key));
+                                        }
+                                    }
                                     Sink::Tss(s) => s.encrypt = Some(Encrypt::new(key)),
                                 }
                             }
@@ -1423,9 +1528,8 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws, local_websocket).await?;
         if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if let Some(s) = sink.as_mut() {
-                s.send(&msg).await;
+            if let Some(writer) = self.ws_map.get(addr).await {
+                writer.send(&msg).await?;
             } else {
                 self.tx.send(Data::Msg(msg.into(), addr))?;
             }
@@ -1840,11 +1944,19 @@ impl RendezvousServer {
             )
             .await??;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Wss(SafeWsSink {
-                sink: a,
-                encrypt: None,
-            }));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+            let writer = Arc::new(WsWriter::new(a));
+            let weak_writer = Arc::downgrade(&writer);
+            let mut closed = writer.closed.subscribe();
+            sink = Some(Sink::Wss(weak_writer.clone()));
+            loop {
+                let incoming = tokio::select! {
+                    biased;
+                    _ = closed.changed() => break,
+                    incoming = timeout(30_000, b.next()) => incoming,
+                };
+                let Ok(Some(Ok(msg))) = incoming else {
+                    break;
+                };
                 if let tungstenite::Message::Binary(bytes) = msg {
                     if transport_blocklist::blocks_ip(transport_ip)
                         || !self.handle_tcp(&bytes, &mut sink, addr, key, ws, local_websocket).await
@@ -1853,13 +1965,22 @@ impl RendezvousServer {
                     }
                 }
             }
+            writer.close();
+            self.ws_map.remove(addr, &weak_writer).await;
+            let addr = try_into_v4(addr);
+            let mut pending = self.tcp_punch.lock().await;
+            if matches!(pending.get(&addr), Some(Sink::Wss(current)) if current.ptr_eq(&weak_writer)) {
+                pending.remove(&addr);
+            }
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
             let (a, mut b) = framed.split();
+            let generation = NEXT_TCP_GENERATION.fetch_add(1, Ordering::Relaxed);
             sink = Some(Sink::Tss(SafeTcpStreamSink {
                 sink: a,
                 encrypt: None,
+                generation,
             }));
             // Avoid key exchange if answering on nat helper port
             if !key.is_empty() {
@@ -1879,9 +2000,9 @@ impl RendezvousServer {
                     break;
                 }
             }
-        }
-        if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            if sink.is_none() {
+                remove_tcp_punch(&mut *self.tcp_punch.lock().await, addr, generation);
+            }
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -2101,6 +2222,116 @@ fn get_symetric_key_from_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn websocket_writer() -> (Arc<WsWriter>, tokio_tungstenite::WebSocketStream<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let connect = async {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            tokio_tungstenite::client_async(format!("ws://{addr}"), stream)
+                .await
+                .unwrap()
+                .0
+        };
+        let (server, client) = tokio::join!(accept, connect);
+        (Arc::new(WsWriter::new(server.split().0)), client)
+    }
+
+    #[tokio::test]
+    async fn websocket_writer_remains_available_for_repeated_forwarding() {
+        let (writer, mut client) = websocket_writer().await;
+        let writers = WsWriters::default();
+        let addr = "127.0.0.1:12345".parse().unwrap();
+        let weak = Arc::downgrade(&writer);
+        writers.insert(addr, weak.clone()).await;
+        let mut local_sink = Some(Sink::Wss(weak));
+        let key = secretbox::gen_key();
+        let mut decrypt = Encrypt::new(key.clone());
+        writer.state.lock().await.encrypt = Some(Encrypt::new(key));
+
+        for port in [1234, 5678] {
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_response(TestNatResponse {
+                port,
+                ..Default::default()
+            });
+            let expected = msg.write_to_bytes().unwrap();
+            writers.get(addr).await.unwrap().send(&msg).await.unwrap();
+            let frame = timeout(1000, client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_data();
+            let mut payload = BytesMut::from(frame.as_ref());
+            decrypt.dec(&mut payload).unwrap();
+            assert_eq!(payload.as_ref(), expected.as_slice());
+
+            let mut reply = Sink::for_punch(&mut local_sink).unwrap();
+            reply.send(&msg).await;
+            let frame = timeout(1000, client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_data();
+            let mut payload = BytesMut::from(frame.as_ref());
+            decrypt.dec(&mut payload).unwrap();
+            assert_eq!(payload.as_ref(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_writer_stale_cleanup_spares_replacement_and_map_cannot_keep_it_alive() {
+        let (old, _old_client) = websocket_writer().await;
+        let (replacement, _replacement_client) = websocket_writer().await;
+        let writers = WsWriters::default();
+        let addr = "127.0.0.1:12345".parse().unwrap();
+        let old_generation = Arc::downgrade(&old);
+        writers.insert(addr, old_generation.clone()).await;
+        writers.insert(addr, Arc::downgrade(&replacement)).await;
+
+        old.close();
+        writers.remove(addr, &old_generation).await;
+        assert!(Arc::ptr_eq(&writers.get(addr).await.unwrap(), &replacement));
+
+        // Simulate dropping the connection task before explicit registry cleanup.
+        drop(replacement);
+        assert!(writers.get(addr).await.is_none());
+        assert!(writers.0.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_punch_cleanup_matches_its_generation_and_transport() {
+        let addr = "127.0.0.1:12345".parse().unwrap();
+        let mut pending = HashMap::new();
+        let (writer, _ws_client) = websocket_writer().await;
+        let weak = Arc::downgrade(&writer);
+        pending.insert(addr, Sink::Wss(weak.clone()));
+        remove_tcp_punch(&mut pending, addr, 1);
+        assert!(matches!(pending.get(&addr), Some(Sink::Wss(current)) if current.ptr_eq(&weak)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (accepted, client) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr().unwrap())
+        );
+        let _tcp_client = client.unwrap();
+        let sink = Framed::new(accepted.unwrap().0, BytesCodec::new()).split().0;
+        pending.insert(addr, Sink::Tss(SafeTcpStreamSink {
+            sink,
+            encrypt: None,
+            generation: 2,
+        }));
+        remove_tcp_punch(&mut pending, addr, 1);
+        assert!(matches!(pending.get(&addr), Some(Sink::Tss(current)) if current.generation == 2));
+        remove_tcp_punch(&mut pending, addr, 2);
+        assert!(!pending.contains_key(&addr));
+    }
 
     #[test]
     fn key_exchange_decodes_client_key() {
