@@ -3,21 +3,22 @@ use async_trait::async_trait;
 use hbbs::{health::Health, transport_blocklist::{self, Service}};
 use hbb_common::{
     allow_err, bail,
-    bytes::{Bytes, BytesMut},
-    futures_util::{sink::SinkExt, stream::StreamExt},
+    bytes::Bytes,
+    bytes_codec::BytesCodec,
+    futures_util::{sink::SinkExt, stream::StreamExt, Sink, Stream},
     log,
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
-    tcp::FramedStream,
     timeout,
     tokio::{
         self,
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{Mutex, RwLock},
         time::{interval, Duration},
     },
+    tokio_util::codec::Framed,
     ResultType,
 };
 use sodiumoxide::crypto::sign;
@@ -26,16 +27,23 @@ use std::{
     io::prelude::*,
     io::Error,
     net::{IpAddr, SocketAddr},
-    sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, Mutex as StdMutex, PoisonError},
+    time::Instant,
 };
 
-type Usage = (usize, usize, usize, usize);
+type Usage = (u64, u64, u64, u64);
 type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>, [IpAddr; 2]);
+
+struct ActiveUsage {
+    generation: Arc<()>,
+    sample: Usage,
+}
 
 lazy_static::lazy_static! {
     static ref PEERS: Mutex<HashMap<String, WaitingPeer>> = Default::default();
-    static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
+    static ref USAGE: StdMutex<HashMap<String, ActiveUsage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
@@ -55,6 +63,8 @@ const WS_DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 const WS_DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+const RELAY_WRITE_TIMEOUT_MS: u64 = 30_000;
+const RELAY_IDLE_TIMEOUT_SECS: u64 = 30;
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start_with_bind(
@@ -320,10 +330,10 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         }
         Some("usage" | "u") => {
             let mut tmp: Vec<(String, Usage)> = USAGE
-                .read()
-                .await
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
-                .map(|x| (x.0.clone(), *x.1))
+                .map(|(id, usage)| (id.clone(), usage.sample))
                 .collect();
             tmp.sort_by(|a, b| ((b.1).1).partial_cmp(&(a.1).1).unwrap());
             for (ip, (elapsed, total, highest, speed)) in tmp {
@@ -484,16 +494,17 @@ async fn make_pair(
             tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
         )
         .await??;
-        make_pair_(ws_stream, addr, transport_ip, key, limiter).await;
+        make_pair_(Box::new(ws_stream), addr, transport_ip, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, transport_ip, key, limiter).await;
+        let stream = Framed::new(stream, BytesCodec::new());
+        make_pair_(Box::new(stream), addr, transport_ip, key, limiter).await;
     }
     Ok(())
 }
 
 /// Checks a configured relay key and pairs a request with a waiting connection.
 async fn make_pair_(
-    stream: impl StreamTrait,
+    mut stream: Box<dyn StreamTrait>,
     addr: SocketAddr,
     transport_ip: IpAddr,
     key: &str,
@@ -503,7 +514,6 @@ async fn make_pair_(
     if addresses.into_iter().any(transport_blocklist::blocks_ip) {
         return;
     }
-    let mut stream = stream;
     stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
@@ -525,7 +535,6 @@ async fn make_pair_(
                         }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
-                        USAGE.write().await.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
                             peer.set_raw();
                             stream.set_raw();
@@ -541,18 +550,17 @@ async fn make_pair_(
                                 log::info!("Active relay closed by managed blocklist");
                                 Ok(())
                             }
-                            result = relay(addr, &mut stream, &mut peer, limiter, id.clone()) => result,
+                            result = relay(addr, stream.into_relay_leg(), peer.into_relay_leg(), limiter, &id) => result,
                         };
                         if let Err(err) = result {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
                             log::info!("Relay of {} closed", addr);
                         }
-                        USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         let generation = Arc::new(());
-                        peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream), addresses));
+                        peers.insert(rf.uuid.clone(), (generation.clone(), stream, addresses));
                         drop(peers);
                         sleep(30.).await;
                         expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
@@ -570,157 +578,259 @@ fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation:
     }
 }
 
-/// Forwards traffic in both directions while enforcing relay limits and timeouts.
+type RelayReader = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>;
+type RelayWriter = Pin<Box<dyn Sink<Bytes, Error = Error> + Send>>;
+
+struct RelayLeg {
+    reader: RelayReader,
+    writer: RelayWriter,
+}
+
+struct RelayUsage<'a> {
+    id: &'a str,
+    generation: Arc<()>,
+    started: Instant,
+    idle_since_ms: AtomicU64,
+    in_flight: AtomicUsize,
+    total_bits: AtomicU64,
+}
+
+impl<'a> RelayUsage<'a> {
+    fn new(id: &'a str) -> Self {
+        let generation = Arc::new(());
+        USAGE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                id.to_owned(),
+                ActiveUsage {
+                    generation: generation.clone(),
+                    sample: Usage::default(),
+                },
+            );
+        Self {
+            id,
+            generation,
+            started: Instant::now(),
+            idle_since_ms: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            total_bits: AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn packet_started(&self) -> InFlightPacket<'_> {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlightPacket(self)
+    }
+
+    fn receive_timed_out(&self, elapsed_ms: u64) -> bool {
+        let idle_ms = elapsed_ms.saturating_sub(self.idle_since_ms.load(Ordering::Relaxed));
+        self.in_flight.load(Ordering::Relaxed) == 0 && idle_ms / 1_000 > RELAY_IDLE_TIMEOUT_SECS
+    }
+
+    fn sample(&self, usage: Usage) {
+        if let Some(entry) = USAGE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(self.id)
+            .filter(|entry| Arc::ptr_eq(&entry.generation, &self.generation))
+        {
+            entry.sample = usage;
+        }
+    }
+}
+
+impl Drop for RelayUsage<'_> {
+    fn drop(&mut self) {
+        let mut active = USAGE.lock().unwrap_or_else(PoisonError::into_inner);
+        if active
+            .get(self.id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.generation, &self.generation))
+        {
+            active.remove(self.id);
+        }
+    }
+}
+
+struct InFlightPacket<'a>(&'a RelayUsage<'a>);
+
+impl Drop for InFlightPacket<'_> {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0
+                .idle_since_ms
+                .store(self.0.elapsed_ms(), Ordering::Relaxed);
+        }
+    }
+}
+
+struct RelayLimiters {
+    per_pair: Limiter,
+    restricted: Limiter,
+    total: Limiter,
+    is_restricted: AtomicBool,
+}
+
+/// Forwards traffic while keeping backpressure local to each direction.
 async fn relay(
     addr: SocketAddr,
-    stream: &mut impl StreamTrait,
-    peer: &mut Box<dyn StreamTrait>,
+    stream: RelayLeg,
+    peer: RelayLeg,
     total_limiter: Limiter,
-    id: String,
+    id: &str,
 ) -> ResultType<()> {
-    let ip = addr.ip().to_string();
-    // The dual-stack listener reports an IPv4 client as ::ffff:a.b.c.d; lists may hold either form.
-    let unmapped = hbb_common::try_into_v4(addr).ip().to_string();
-    let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&unmapped);
-    let mut tm = std::time::Instant::now();
-    let mut elapsed = 0;
-    let mut total = 0;
-    let mut total_s = 0;
-    let mut highest_s = 0;
-    let mut downgrade: bool = false;
-    let mut blacked: bool = false;
-    let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
-    let limiter = <Limiter>::new(sb);
-    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as _);
-    let downgrade_threshold =
-        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
-    let mut timer = interval(Duration::from_secs(3));
-    let mut last_recv_time = std::time::Instant::now();
-    loop {
-        tokio::select! {
-            res = peer.recv() => {
-                if let Some(Ok(bytes)) = res {
-                    last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
-                    if blacked || downgrade {
-                        blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
-                    }
-                    total_limiter.consume(nb).await;
-                    total += nb;
-                    total_s += nb;
-                    if !bytes.is_empty() {
-                        timeout(30_000, stream.send_raw(bytes.into())).await??;
-                    }
-                } else {
-                    break;
-                }
-            },
-            res = stream.recv() => {
-                if let Some(Ok(bytes)) = res {
-                    last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
-                    if blacked || downgrade {
-                        blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
-                    }
-                    total_limiter.consume(nb).await;
-                    total += nb;
-                    total_s += nb;
-                    if !bytes.is_empty() {
-                        timeout(30_000, peer.send_raw(bytes.into())).await??;
-                    }
-                } else {
-                    break;
-                }
-            },
-            _ = timer.tick() => {
-                if last_recv_time.elapsed().as_secs() > 30 {
-                    bail!("Timeout");
-                }
-            }
-        }
+    let usage = RelayUsage::new(id);
+    let limiters = RelayLimiters {
+        per_pair: Limiter::new(SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64),
+        restricted: Limiter::new(LIMIT_SPEED.load(Ordering::SeqCst) as f64),
+        total: total_limiter,
+        is_restricted: AtomicBool::new(false),
+    };
 
-        let n = tm.elapsed().as_millis() as usize;
-        if n >= 1_000 {
-            if listed(&*BLOCKLIST.read().await) {
-                log::info!("{} blocked", ip);
-                break;
-            }
-            blacked = listed(&*BLACKLIST.read().await);
-            tm = std::time::Instant::now();
-            let speed = total_s / n;
-            if speed > highest_s {
-                highest_s = speed;
-            }
-            elapsed += n;
-            USAGE.write().await.insert(
-                id.clone(),
-                (elapsed as _, total as _, highest_s as _, speed as _),
-            );
-            total_s = 0;
-            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::SeqCst)
-                && !downgrade
-                && total > elapsed * downgrade_threshold
-            {
-                downgrade = true;
-                log::info!(
-                    "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
-                    id,
-                    downgrade_threshold,
-                    elapsed
-                );
-            }
+    // Each scoped future holds at most one incoming packet until its write finishes.
+    // A close, timeout or policy cancellation drops both directions and both sockets.
+    tokio::select! {
+        result = forward(stream.reader, peer.writer, &usage, &limiters) => result,
+        result = forward(peer.reader, stream.writer, &usage, &limiters) => result,
+        result = supervise_relay(addr, &usage, &limiters) => result,
+    }
+}
+
+async fn forward(
+    mut reader: RelayReader,
+    mut writer: RelayWriter,
+    usage: &RelayUsage<'_>,
+    limiters: &RelayLimiters,
+) -> ResultType<()> {
+    while let Some(Ok(bytes)) = reader.next().await {
+        let _packet = usage.packet_started();
+        let bits = bytes.len() as u64 * 8;
+        let pair_limiter = if limiters.is_restricted.load(Ordering::Relaxed) {
+            &limiters.restricted
+        } else {
+            &limiters.per_pair
+        };
+        consume_bits(pair_limiter, bits).await;
+        consume_bits(&limiters.total, bits).await;
+        usage.total_bits.fetch_add(bits, Ordering::Relaxed);
+        if !bytes.is_empty() {
+            timeout(RELAY_WRITE_TIMEOUT_MS, writer.send(bytes)).await??;
         }
     }
     Ok(())
+}
+
+async fn consume_bits(limiter: &Limiter, mut bits: u64) {
+    // The limiter accepts usize. On 32-bit builds a framed input can exceed
+    // usize::MAX bits even when its byte length fits.
+    while usize::try_from(bits).is_err() {
+        limiter.consume(usize::MAX).await;
+        bits -= usize::MAX as u64;
+    }
+    limiter.consume(bits as usize).await;
+}
+
+async fn supervise_relay(
+    addr: SocketAddr,
+    usage: &RelayUsage<'_>,
+    limiters: &RelayLimiters,
+) -> ResultType<()> {
+    let ip = addr.ip().to_string();
+    // The dual-stack listener reports an IPv4 client as ::ffff:a.b.c.d.
+    let unmapped = hbb_common::try_into_v4(addr).ip().to_string();
+    let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&unmapped);
+    let threshold = (limiters.per_pair.speed_limit()
+        * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64
+        / 100.
+        / 1000.) as u64;
+    let mut timer = interval(Duration::from_secs(1));
+    let mut previous_ms = 0;
+    let mut previous_bits = 0;
+    let mut highest_speed = 0;
+    let mut downgraded = false;
+
+    loop {
+        timer.tick().await;
+        let elapsed_ms = usage.elapsed_ms();
+        if usage.receive_timed_out(elapsed_ms) {
+            bail!("Timeout");
+        }
+
+        let sample_ms = elapsed_ms - previous_ms;
+        if sample_ms < 1_000 {
+            continue;
+        }
+        if listed(&*BLOCKLIST.read().await) {
+            log::info!("{} blocked", ip);
+            return Ok(());
+        }
+        let blacklisted = listed(&*BLACKLIST.read().await);
+        let total_bits = usage.total_bits.load(Ordering::Relaxed);
+        let speed = total_bits.wrapping_sub(previous_bits) / sample_ms;
+        highest_speed = highest_speed.max(speed);
+        usage.sample((elapsed_ms, total_bits, highest_speed, speed));
+        previous_bits = total_bits;
+        previous_ms = elapsed_ms;
+
+        if !downgraded
+            && elapsed_ms > DOWNGRADE_START_CHECK.load(Ordering::SeqCst) as u64
+            && total_bits > elapsed_ms.saturating_mul(threshold)
+        {
+            downgraded = true;
+            log::info!(
+                "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
+                usage.id,
+                threshold,
+                elapsed_ms
+            );
+        }
+        limiters
+            .is_restricted
+            .store(blacklisted || downgraded, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct TestStream {
-        data: Option<BytesMut>,
-        blocked: bool,
-    }
-
-    #[async_trait]
-    impl StreamTrait for TestStream {
-        /// Provides the test stream receive behavior.
-        async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
-            match self.data.take() {
-                Some(data) => Some(Ok(data)),
-                None => std::future::pending().await,
-            }
-        }
-        /// Simulates a relay write for the test stream.
-        async fn send_raw(&mut self, _: Bytes) -> ResultType<()> {
-            if self.blocked { std::future::pending().await } else { Ok(()) }
-        }
-        /// Uses non-WebSocket framing for the test stream.
-        fn is_ws(&self) -> bool { false }
-        /// Leaves the test stream unchanged when raw mode is requested.
-        fn set_raw(&mut self) {}
-        fn set_max_packet_length(&mut self, _: usize) {}
+    fn raw_leg(stream: tokio::io::DuplexStream) -> RelayLeg {
+        let mut stream = Framed::new(stream, BytesCodec::new());
+        stream.set_raw();
+        Box::new(stream).into_relay_leg()
     }
 
     /// Checks that a blocked relay write ends with a timeout in the selected direction.
     async fn check_blocked_send(from_peer: bool) {
-        let mut stream = TestStream {
-            data: if from_peer { None } else { Some(BytesMut::from(&b"x"[..])) },
-            blocked: from_peer,
+        let (mut source, relay_source) = tokio::io::duplex(16);
+        let (_destination, relay_destination) = tokio::io::duplex(4);
+        source.write_all(&[1; 16]).await.unwrap();
+        let (stream, peer) = if from_peer {
+            (raw_leg(relay_destination), raw_leg(relay_source))
+        } else {
+            (raw_leg(relay_source), raw_leg(relay_destination))
         };
-        let mut peer: Box<dyn StreamTrait> = Box::new(TestStream {
-            data: if from_peer { Some(BytesMut::from(&b"x"[..])) } else { None },
-            blocked: !from_peer,
-        });
-        let result = timeout(35_000, relay(
-            "127.0.0.1:1".parse().unwrap(), &mut stream, &mut peer,
-            Limiter::new(1_000_000.), "blocked-send-test".to_owned(),
-        )).await.expect("a blocked relay write must finish within its deadline");
+        let id = if from_peer {
+            "blocked-send-from-peer"
+        } else {
+            "blocked-send-from-stream"
+        };
+        let result = timeout(
+            35_000,
+            relay(
+                "127.0.0.1:1".parse().unwrap(),
+                stream,
+                peer,
+                Limiter::new(1_000_000.),
+                id,
+            ),
+        )
+        .await
+        .expect("a blocked relay write must finish within its deadline");
         let error = result.expect_err("the blocked write must fail");
         assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
     }
@@ -732,31 +842,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_traffic_survives_a_blocked_write_and_abort_cleans_up() {
+        let (mut source, relay_source) = tokio::io::duplex(16);
+        let (mut destination, relay_destination) = tokio::io::duplex(4);
+        let id = "reverse-while-write-blocked";
+        let total_limiter = Limiter::new(f64::INFINITY);
+        let task = tokio::spawn(relay(
+            "127.0.0.1:1".parse().unwrap(),
+            raw_leg(relay_source),
+            raw_leg(relay_destination),
+            total_limiter.clone(),
+            id,
+        ));
+
+        source.write_all(&[7; 16]).await.unwrap();
+        // The destination can buffer four of the sixteen bytes. Reading just one
+        // proves forwarding started while leaving the write stalled.
+        let mut first = [0];
+        timeout(1_000, destination.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, [7]);
+
+        destination.write_all(b"ok").await.unwrap();
+        let mut reply = [0; 2];
+        timeout(1_000, source.read_exact(&mut reply))
+            .await
+            .expect("the blocked destination stalled reverse traffic")
+            .unwrap();
+        assert_eq!(&reply, b"ok");
+        assert_eq!(total_limiter.total_bytes_consumed(), (16 + 2) * 8);
+        assert!(USAGE.lock().unwrap().contains_key(id));
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!USAGE.lock().unwrap().contains_key(id));
+        assert_eq!(source.read(&mut reply).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn finishing_an_old_relay_preserves_replacement_usage() {
+        let id = "reused-usage-id";
+        let old = RelayUsage::new(id);
+        let replacement = RelayUsage::new(id);
+        replacement.sample((1, 2, 3, 4));
+        old.sample((5, 6, 7, 8));
+        drop(old);
+        assert_eq!(USAGE.lock().unwrap().get(id).unwrap().sample, (1, 2, 3, 4));
+        drop(replacement);
+        assert!(!USAGE.lock().unwrap().contains_key(id));
+    }
+
+    #[test]
+    fn receive_deadline_waits_for_both_packets_to_finish() {
+        let usage = RelayUsage::new("receive-deadline");
+        let expired_ms = (RELAY_IDLE_TIMEOUT_SECS + 1) * 1_000;
+        assert!(usage.receive_timed_out(expired_ms));
+
+        let outgoing = usage.packet_started();
+        let incoming = usage.packet_started();
+        assert!(!usage.receive_timed_out(expired_ms));
+        drop(outgoing);
+        assert!(!usage.receive_timed_out(expired_ms));
+        drop(incoming);
+
+        let idle_since_ms = usage.idle_since_ms.load(Ordering::Relaxed);
+        assert!(!usage.receive_timed_out(idle_since_ms + expired_ms - 1));
+        assert!(usage.receive_timed_out(idle_since_ms + expired_ms));
+    }
+
+    #[tokio::test]
     async fn only_a_blocklisted_ipv4_client_on_the_dual_stack_listener_is_cut_off() {
         // The plain form is what `ba` is usually given; the mapped one is what `usage` shows.
-        // A client not listed must outlive the first list check, which runs at 3 s.
+        // A client not listed must outlive the periodic list check.
         for (entry, client, cut_off) in [
             ("192.0.2.55", "[::ffff:192.0.2.55]:1", true),
             ("::ffff:192.0.2.55", "[::ffff:192.0.2.55]:1", true),
             ("192.0.2.55", "[::ffff:192.0.2.56]:1", false),
         ] {
             BLOCKLIST.write().await.insert(entry.to_owned());
-            let mut stream = TestStream {
-                data: None,
-                blocked: false,
-            };
-            let mut peer: Box<dyn StreamTrait> = Box::new(TestStream {
-                data: None,
-                blocked: false,
-            });
+            let (_client, stream) = tokio::io::duplex(8);
+            let (_remote, peer) = tokio::io::duplex(8);
             let result = timeout(
                 if cut_off { 10_000 } else { 4_000 },
                 relay(
                     client.parse().unwrap(),
-                    &mut stream,
-                    &mut peer,
+                    raw_leg(stream),
+                    raw_leg(peer),
                     Limiter::new(1_000_000.),
-                    "blocklist-test".to_owned(),
+                    "blocklist-test",
                 ),
             )
             .await;
@@ -817,21 +992,20 @@ fn get_server_sk(key: &str) -> ResultType<String> {
 
 #[async_trait]
 trait StreamTrait: Send + Sync + 'static {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>>;
-    async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
     fn set_max_packet_length(&mut self, n: usize);
+    fn into_relay_leg(self: Box<Self>) -> RelayLeg;
 }
 
 #[async_trait]
-impl StreamTrait for FramedStream {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
-        self.next().await
-    }
-
-    async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
-        self.send_bytes(bytes).await
+impl<T> StreamTrait for Framed<T, BytesCodec>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>> {
+        self.next().await.map(|frame| frame.map(|bytes| bytes.freeze()))
     }
 
     fn is_ws(&self) -> bool {
@@ -839,36 +1013,34 @@ impl StreamTrait for FramedStream {
     }
 
     fn set_raw(&mut self) {
-        self.set_raw();
+        self.codec_mut().set_raw();
     }
 
     fn set_max_packet_length(&mut self, n: usize) {
         self.codec_mut().set_max_packet_length(n);
     }
+
+    fn into_relay_leg(self: Box<Self>) -> RelayLeg {
+        let (writer, reader) = StreamExt::split(*self);
+        RelayLeg {
+            reader: Box::pin(reader.map(|frame| frame.map(|bytes| bytes.freeze()))),
+            writer: Box::pin(writer),
+        }
+    }
+}
+
+fn websocket_bytes(message: Result<tungstenite::Message, tungstenite::Error>) -> Result<Bytes, Error> {
+    match message {
+        Ok(tungstenite::Message::Binary(bytes)) => Ok(bytes),
+        Ok(_) => Ok(Bytes::new()),
+        Err(error) => Err(Error::other(error)),
+    }
 }
 
 #[async_trait]
 impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
-        if let Some(msg) = self.next().await {
-            match msg {
-                Ok(msg) => {
-                    match msg {
-                        tungstenite::Message::Binary(bytes) => {
-                            Some(Ok(bytes[..].into())) // to-do: poor performance
-                        }
-                        _ => Some(Ok(BytesMut::new())),
-                    }
-                }
-                Err(err) => Some(Err(Error::new(std::io::ErrorKind::Other, err.to_string()))),
-            }
-        } else {
-            None
-        }
-    }
-
-    async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
-        Ok(self.send(tungstenite::Message::Binary(bytes)).await?)
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>> {
+        self.next().await.map(websocket_bytes)
     }
 
     fn is_ws(&self) -> bool {
@@ -883,12 +1055,23 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
             c.max_frame_size = Some(n.min(WS_DEFAULT_MAX_FRAME_SIZE));
         });
     }
+
+    fn into_relay_leg(self: Box<Self>) -> RelayLeg {
+        let (writer, reader) = StreamExt::split(*self);
+        let writer = writer.sink_map_err(Error::other).with(|bytes| {
+            std::future::ready(Ok(tungstenite::Message::Binary(bytes)))
+        });
+        RelayLeg {
+            reader: Box::pin(reader.map(websocket_bytes)),
+            writer: Box::pin(writer),
+        }
+    }
 }
 
 #[cfg(test)]
 mod message_size_tests {
     use super::*;
-    use hbb_common::{bytes_codec::BytesCodec, tokio_util::codec::Encoder};
+    use hbb_common::{bytes::BytesMut, tcp::FramedStream, tokio_util::codec::Encoder};
 
     async fn serve_one(ws: bool) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -987,27 +1170,18 @@ mod message_size_tests {
             .expect("relay did not forward the websocket message")
             .unwrap();
         assert_eq!(&got[..], &big[..]);
+
+        ws.close(None).await.unwrap();
+        let closed = timeout(5_000, tcp.next())
+            .await
+            .expect("the websocket close did not end the TCP leg");
+        assert!(closed.is_none());
     }
 }
 
 #[cfg(test)]
 mod waiter_tests {
     use super::*;
-
-    struct TestStream;
-
-    #[async_trait]
-    impl StreamTrait for TestStream {
-        /// Provides the test stream receive behavior.
-        async fn recv(&mut self) -> Option<Result<BytesMut, Error>> { None }
-        /// Simulates a relay write for the test stream.
-        async fn send_raw(&mut self, _: Bytes) -> ResultType<()> { Ok(()) }
-        /// Uses non-WebSocket framing for the test stream.
-        fn is_ws(&self) -> bool { false }
-        /// Leaves the test stream unchanged when raw mode is requested.
-        fn set_raw(&mut self) {}
-        fn set_max_packet_length(&mut self, _: usize) {}
-    }
 
     /// Checks that an old timeout cannot remove a replacement waiter.
     #[test]
@@ -1016,7 +1190,9 @@ mod waiter_tests {
         let current = Arc::new(());
         let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
         let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream), [local; 2]));
+        let (_client, stream) = tokio::io::duplex(8);
+        let stream = Framed::new(stream, BytesCodec::new());
+        peers.insert("pair".to_owned(), (current.clone(), Box::new(stream), [local; 2]));
         expire_waiter(&mut peers, "pair", &old);
         assert!(peers.contains_key("pair"));
         expire_waiter(&mut peers, "pair", &current);
