@@ -357,3 +357,18 @@ by ID. Direct connections that bypass HBBS and HBBR follow endpoint and network
 controls. HBBR continues to read its local `blocklist.txt` and `blacklist.txt`.
 For proxied WebSockets, restrict direct access to the WebSocket ports and have
 the proxy overwrite the client IP header with the observed client address.
+
+## WebClient guest sessions
+
+Use an S6 deployment with Console, HBBS and HBBR in the same network namespace.
+On Console, set `RUSTDESK_API_APP_WEB_GUESTS=true` and configure the server
+public key in **Client settings**. On HBBS, set `RUSTDESK_GUEST_RELAY_ADDRESS`
+to the same local HBBR instance's public address as used by controlled clients.
+HBBS and Console share `RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN`. Keep the
+standard WebSocket listeners internal to the deployment and expose
+`/api/web-guests/relay` through the Console reverse proxy with WebSocket upgrades
+and subprotocol negotiation enabled.
+
+A guest link authorizes one registered device. Device approval or password
+requirements still apply. Console ends the guest transport when the link
+expires, is revoked, or matches a managed blocklist rule.
