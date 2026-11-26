@@ -335,3 +335,25 @@ and mouse, clipboard, and file transfer. hbbs attaches them to newly created
 punch, LAN and relay negotiation messages. Only desktop targets that consume
 the control-permissions field apply these restrictions. Android targets and
 the signed Switch Sides grant flow follow their existing behavior.
+
+## Console-managed blocklist
+
+Use a Console and paired Server version that support managed blocklists. Set
+`RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN` to the same secret on Console,
+hbbs, and hbbr. Give both Server processes the Console base URL in
+`RUSTDESK_API_RUSTDESK_API_SERVER`. Remote URLs require HTTPS. A cleartext URL
+must use a numeric loopback address in the same network namespace.
+
+Console's **Devices & access → Server blocklist** page shows which daemon has
+reported applying the current rules. Each daemon polls every 15 seconds and
+reports the applied revision on its next poll. A daemon retains its last good
+rules in memory if refresh fails. After a restart it needs a successful
+snapshot before it can enforce Console rules.
+
+Device ID rules cover registration and new HBBS routing. IP address and CIDR
+rules cover HBBS traffic and both legs of new and established HBBR relays.
+A relayed leg has no authenticated device ID for terminating an existing relay
+by ID. Direct connections that bypass HBBS and HBBR follow endpoint and network
+controls. HBBR continues to read its local `blocklist.txt` and `blacklist.txt`.
+For proxied WebSockets, restrict direct access to the WebSocket ports and have
+the proxy overwrite the client IP header with the observed client address.

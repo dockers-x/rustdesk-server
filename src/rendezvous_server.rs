@@ -1,6 +1,7 @@
 use crate::{common::*, health::Health};
 use crate::{geo_relay, routing_auth, runtime_config, switch_grant, transport_hints};
 use crate::peer::*;
+use crate::transport_blocklist::{self, Service};
 use hbb_common::bytes::BufMut;
 use hbb_common::{
     allow_err, bail,
@@ -126,6 +127,24 @@ fn control_permissions(mask: u64) -> MessageField<ControlPermissions> {
         permissions: mask,
         ..Default::default()
     }))
+}
+
+fn blocked_punch_response() -> RendezvousMessage {
+    let mut message = RendezvousMessage::new();
+    message.set_punch_hole_response(PunchHoleResponse {
+        other_failure: "Connection denied by server policy".to_owned(),
+        ..Default::default()
+    });
+    message
+}
+
+fn blocked_relay_response() -> RendezvousMessage {
+    let mut message = RendezvousMessage::new();
+    message.set_relay_response(RelayResponse {
+        refuse_reason: "Connection denied by server policy".to_owned(),
+        ..Default::default()
+    });
+    message
 }
 
 async fn target_admitted(id: &str, peer: &LockPeer) -> bool {
@@ -375,8 +394,11 @@ impl RendezvousServer {
                         std::process::exit(1);
                     }
                 }
+                transport_blocklist::spawn_refresh(Service::Hbbs);
             });
-        };
+        } else {
+            transport_blocklist::spawn_refresh(Service::Hbbs);
+        }
         let main_task = async move {
             loop {
                 log::info!(target: "service.ready", "Start");
@@ -454,7 +476,11 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
+                        Data::Msg(msg, addr) => {
+                            if !transport_blocklist::blocks_ip(addr.ip()) {
+                                allow_err!(socket.send(msg.as_ref(), addr).await);
+                            }
+                        }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RuntimeRelayServers(rs, revision) => {
                             if runtime_config::snapshot().is_some_and(|config| config.revision == revision) {
@@ -545,11 +571,16 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        if transport_blocklist::blocks_ip(addr.ip()) {
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
-                    if !rp.id.is_empty() && rp.id.len() <= MAX_PEER_ID_LEN {
+                    if !rp.id.is_empty() && rp.id.len() <= MAX_PEER_ID_LEN
+                        && !transport_blocklist::blocks_device(&rp.id)
+                    {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         let request_pk = self.update_addr(rp.id, addr).await;
                         let mut msg_out = RendezvousMessage::new();
@@ -642,12 +673,15 @@ impl RendezvousServer {
         ws: bool,
         local_websocket: bool,
     ) -> bool {
+        if transport_blocklist::blocks_ip(addr.ip()) {
+            return false;
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             // log::debug!("Received TCP message from {}: {:?}", addr, msg_in);
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
-                    if !rp.id.is_empty() {
+                    if !rp.id.is_empty() && !transport_blocklist::blocks_device(&rp.id) {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         let request_pk = self.update_addr(rp.id, addr).await;
                         let mut msg_out = RendezvousMessage::new();
@@ -676,6 +710,10 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if transport_blocklist::blocks_device(&rf.id) {
+                        Self::send_to_sink(sink, blocked_relay_response()).await;
+                        return true;
+                    }
                     if let Some(denial) = routing_auth::relay_denial(
                         &rf,
                         key,
@@ -720,6 +758,13 @@ impl RendezvousServer {
                             Self::send_to_sink(sink, response).await;
                             return true;
                         }
+                        let peer_addr = peer.read().await.socket_addr;
+                        if transport_blocklist::blocks_ip(peer_addr.ip())
+                            || transport_blocklist::blocks_device(&rf.id)
+                        {
+                            Self::send_to_sink(sink, blocked_relay_response()).await;
+                            return true;
+                        }
                         if let Some(sink) = sink.take() {
                             self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                         }
@@ -728,7 +773,6 @@ impl RendezvousServer {
                         // Never forward control bits supplied by the requester.
                         rf.control_permissions = control_permissions(permissions);
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                     }
                     return true;
@@ -770,6 +814,9 @@ impl RendezvousServer {
                     }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
+                    if transport_blocklist::blocks_device(id) || transport_blocklist::blocks_ip(addr_b.ip()) {
+                        return false;
+                    }
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
                         rr.set_pk(pk);
@@ -884,8 +931,15 @@ impl RendezvousServer {
     async fn peers_online_state(&mut self, peers: Vec<String>) -> BytesMut {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
+            if transport_blocklist::blocks_device(peer_id) {
+                continue;
+            }
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                let peer = peer.read().await;
+                if transport_blocklist::blocks_ip(peer.socket_addr.ip()) {
+                    continue;
+                }
+                let elapsed = peer.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
@@ -907,6 +961,9 @@ impl RendezvousServer {
             return Err(INVALID_ID_FORMAT);
         }
         let id = rk.id;
+        if transport_blocklist::blocks_device(&id) || transport_blocklist::blocks_ip(addr.ip()) {
+            return Err(register_pk_response::Result::SERVER_ERROR);
+        }
         let ip = addr.ip().to_string();
         if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
             return Err(UUID_MISMATCH);
@@ -919,6 +976,9 @@ impl RendezvousServer {
             routing_auth::Admission::Allowed => {}
             routing_auth::Admission::Pending => return Err(register_pk_response::Result::NOT_DEPLOYED),
             routing_auth::Admission::Unavailable => return Err(register_pk_response::Result::SERVER_ERROR),
+        }
+        if transport_blocklist::blocks_device(&id) || transport_blocklist::blocks_ip(addr.ip()) {
+            return Err(register_pk_response::Result::SERVER_ERROR);
         }
         let peer = self.pm.get_or(&id).await;
         let (changed, ip_changed) = {
@@ -1049,6 +1109,9 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
+        if transport_blocklist::blocks_device(&phs.id) || transport_blocklist::blocks_ip(addr_a.ip()) {
+            return Ok(());
+        }
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -1088,6 +1151,9 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // relay local addrs of B to A
         let addr_a = AddrMangle::decode(&la.socket_addr);
+        if transport_blocklist::blocks_device(&la.id) || transport_blocklist::blocks_ip(addr_a.ip()) {
+            return Ok(());
+        }
         log::debug!(
             "{} local addrs response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -1126,6 +1192,9 @@ impl RendezvousServer {
         local_websocket: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        if transport_blocklist::blocks_device(&ph.id) {
+            return Ok((blocked_punch_response(), None));
+        }
         let guest_relay = if routing_auth::has_guest_proof(&ph.token) {
             let address = routing_auth::guest_relay(&ph, local_websocket)
                 .filter(|address| test_if_valid_server(address, "guest-relay").is_ok());
@@ -1183,6 +1252,9 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
+            if transport_blocklist::blocks_ip(peer_addr.ip()) || transport_blocklist::blocks_device(&id) {
+                return Ok((blocked_punch_response(), None));
+            }
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1681,6 +1753,9 @@ impl RendezvousServer {
             });
             return;
         }
+        if transport_blocklist::blocks_ip(addr.ip()) {
+            return;
+        }
         let mut stream = FramedStream::from(stream, addr);
         stream.codec_mut().set_max_packet_length(*MAX_MESSAGE);
         tokio::spawn(async move {
@@ -1707,6 +1782,9 @@ impl RendezvousServer {
     }
 
     async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
+        if transport_blocklist::blocks_ip(addr.ip()) {
+            return;
+        }
         log::debug!("Tcp connection from {:?}, ws: {}", addr, ws);
         let mut rs = self.clone();
         let key = key.to_owned();
@@ -1726,6 +1804,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         if ws {
+            let transport_ip = addr.ip();
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let local_websocket = try_into_v4(addr).ip().is_loopback();
             let callback = |req: &Request, response: Response| {
@@ -1767,7 +1846,9 @@ impl RendezvousServer {
             }));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, local_websocket).await {
+                    if transport_blocklist::blocks_ip(transport_ip)
+                        || !self.handle_tcp(&bytes, &mut sink, addr, key, ws, local_websocket).await
+                    {
                         break;
                     }
                 }

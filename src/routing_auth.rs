@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 static AUTH_SLOTS: Semaphore = Semaphore::const_new(32);
-static AUTH_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
+pub(crate) static AUTH_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
@@ -39,7 +39,7 @@ fn authorization_endpoint(base: &str) -> Option<reqwest::Url> {
     console_endpoint(base, "authorize-connection")
 }
 
-fn console_endpoint(base: &str, endpoint: &str) -> Option<reqwest::Url> {
+pub(crate) fn console_endpoint(base: &str, endpoint: &str) -> Option<reqwest::Url> {
     let mut url = reqwest::Url::parse(base).ok()?;
     // Never forward user tokens to cleartext remote HTTP or embedded credentials.
     let local = url.host_str().is_some_and(|host| {
@@ -73,13 +73,20 @@ struct AuthorizationResponse {
 }
 
 async fn read_reply<T: serde::de::DeserializeOwned>(request: reqwest::RequestBuilder) -> Option<T> {
+    read_bounded_reply(request, 256).await
+}
+
+pub(crate) async fn read_bounded_reply<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    limit: usize,
+) -> Option<T> {
     let mut response = request.send().await.ok()?;
     if response.status() != reqwest::StatusCode::OK {
         return None;
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len() + chunk.len() > 256 {
+        if chunk.len() > limit.saturating_sub(body.len()) {
             return None;
         }
         body.extend_from_slice(&chunk);
@@ -113,7 +120,7 @@ pub(crate) enum Admission {
     Unavailable,
 }
 
-static ADMISSION_TOKEN: Lazy<String> =
+pub(crate) static ADMISSION_TOKEN: Lazy<String> =
     Lazy::new(|| std::env::var("RUSTDESK_API_SECURITY_HBBS_ADMISSION_TOKEN").unwrap_or_default());
 static ADMISSION_SLOTS: Semaphore = Semaphore::const_new(32);
 

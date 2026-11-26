@@ -1,6 +1,6 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
-use hbbs::health::Health;
+use hbbs::{health::Health, transport_blocklist::{self, Service}};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -31,7 +31,7 @@ use std::{
 };
 
 type Usage = (usize, usize, usize, usize);
-type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
+type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>, [IpAddr; 2]);
 
 lazy_static::lazy_static! {
     static ref PEERS: Mutex<HashMap<String, WaitingPeer>> = Default::default();
@@ -99,6 +99,7 @@ pub async fn start_with_bind(
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    transport_blocklist::spawn_refresh(Service::Hbbr);
     let main_task = async move {
         loop {
             io_loop(
@@ -430,7 +431,7 @@ async fn handle_connection(
     let ip = ip.to_string();
     let reported = addr.ip().to_string();
     let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&reported);
-    if listed(&*BLOCKLIST.read().await) {
+    if transport_blocklist::blocks_ip(addr.ip()) || listed(&*BLOCKLIST.read().await) {
         log::info!("{} blocked", ip);
         return;
     }
@@ -449,6 +450,7 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
+    let transport_ip = addr.ip();
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
@@ -482,15 +484,25 @@ async fn make_pair(
             tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
         )
         .await??;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, transport_ip, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, transport_ip, key, limiter).await;
     }
     Ok(())
 }
 
 /// Checks a configured relay key and pairs a request with a waiting connection.
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    transport_ip: IpAddr,
+    key: &str,
+    limiter: Limiter,
+) {
+    let addresses = [addr.ip(), transport_ip];
+    if addresses.into_iter().any(transport_blocklist::blocks_ip) {
+        return;
+    }
     let mut stream = stream;
     stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
@@ -502,8 +514,15 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                 }
                 if !rf.uuid.is_empty() {
                     let mut peers = PEERS.lock().await;
-                    if let Some((_, mut peer)) = peers.remove(&rf.uuid) {
+                    if addresses.into_iter().any(transport_blocklist::blocks_ip) {
+                        return;
+                    }
+                    if let Some((_, mut peer, peer_addresses)) = peers.remove(&rf.uuid) {
                         drop(peers);
+                        let pair_addresses = [addresses[0], addresses[1], peer_addresses[0], peer_addresses[1]];
+                        if pair_addresses.into_iter().any(transport_blocklist::blocks_ip) {
+                            return;
+                        }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -516,8 +535,15 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             peer.set_max_packet_length(usize::MAX);
                             stream.set_max_packet_length(usize::MAX);
                         }
-                        if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
-                        {
+                        let result = tokio::select! {
+                            biased;
+                            _ = transport_blocklist::wait_until_blocked(pair_addresses) => {
+                                log::info!("Active relay closed by managed blocklist");
+                                Ok(())
+                            }
+                            result = relay(addr, &mut stream, &mut peer, limiter, id.clone()) => result,
+                        };
+                        if let Err(err) = result {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
                             log::info!("Relay of {} closed", addr);
@@ -526,7 +552,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         let generation = Arc::new(());
-                        peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream)));
+                        peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream), addresses));
                         drop(peers);
                         sleep(30.).await;
                         expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
@@ -539,7 +565,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
 
 /// Removes a waiting connection only if it still owns the requested pair ID.
 fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) {
-    if peers.get(id).map(|(current, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
+    if peers.get(id).map(|(current, _, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
         peers.remove(id);
     }
 }
@@ -989,7 +1015,8 @@ mod waiter_tests {
         let old = Arc::new(());
         let current = Arc::new(());
         let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
-        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream)));
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream), [local; 2]));
         expire_waiter(&mut peers, "pair", &old);
         assert!(peers.contains_key("pair"));
         expire_waiter(&mut peers, "pair", &current);

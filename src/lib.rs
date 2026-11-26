@@ -9,6 +9,7 @@ mod peer;
 mod runtime_config;
 mod routing_auth;
 mod switch_grant;
+pub mod transport_blocklist;
 mod transport_hints;
 mod version;
 pub mod jwt;
