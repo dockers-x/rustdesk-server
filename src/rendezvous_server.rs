@@ -216,9 +216,17 @@ struct Inner {
     secure_tcp_sk_b: SecretKey,
 }
 
+struct GuestRelay {
+    peer_id: String,
+    peer_ip: std::net::IpAddr,
+    uuid: String,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    guest_relays: Arc<Mutex<HashMap<SocketAddr, GuestRelay>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -296,6 +304,7 @@ impl RendezvousServer {
                 secure_tcp_sk_b,
             }),
             ws_map: Arc::new(Mutex::new(HashMap::new())),
+            guest_relays: Arc::new(Mutex::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -631,6 +640,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        local_websocket: bool,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             // log::debug!("Received TCP message from {}: {:?}", addr, msg_in);
@@ -662,7 +672,7 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws, local_websocket).await);
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -732,6 +742,32 @@ impl RendezvousServer {
                         return false;
                     }
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    let guest = {
+                        let mut pending = self.guest_relays.lock().await;
+                        let requester = try_into_v4(addr_b);
+                        match pending.get(&requester) {
+                            Some(guest) if guest.expires_at > Instant::now()
+                                && guest.peer_ip == try_into_v4(addr).ip()
+                                && rr.uuid.is_empty()
+                                && !rr.version.is_empty() => pending.remove(&requester),
+                            Some(_) => return true,
+                            None => None,
+                        }
+                    };
+                    if let Some(guest) = guest {
+                        // A regular peer ACK to RequestRelay carries no UUID. Only the
+                        // route reserved by HBBS can be returned to the guest gateway.
+                        let pk = self.get_pk(&rr.version, guest.peer_id).await;
+                        let mut response = RendezvousMessage::new();
+                        response.set_relay_response(RelayResponse {
+                            uuid: guest.uuid,
+                            version: rr.version,
+                            union: Some(relay_response::Union::Pk(pk)),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(response, addr_b).await);
+                        return true;
+                    }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
                     if !id.is_empty() {
@@ -1087,19 +1123,35 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        local_websocket: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        let guest_relay = if routing_auth::has_guest_proof(&ph.token) {
+            let address = routing_auth::guest_relay(&ph, local_websocket)
+                .filter(|address| test_if_valid_server(address, "guest-relay").is_ok());
+            if address.is_none() {
+                let mut response = RendezvousMessage::new();
+                response.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: "Guest connection not authorized".to_owned(),
+                    ..Default::default()
+                });
+                return Ok((response, None));
+            }
+            address
+        } else {
+            None
+        };
         if let Some(denial) = routing_auth::punch_denial(
             &ph,
             key,
-            MUST_LOGIN.load(Ordering::SeqCst),
+            guest_relay.is_none() && MUST_LOGIN.load(Ordering::SeqCst),
             &jwt::SECRET,
         ) {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(denial);
             return Ok((msg_out, None));
         }
-        let permissions = if switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type) {
+        let permissions = if guest_relay.is_some() || switch_grant::allows(&ph.id, &ph.switch_code, ph.conn_type) {
             Some(0)
         } else {
             routing_auth::connection_permissions(&ph.id, &ph.token, MUST_LOGIN.load(Ordering::SeqCst)).await
@@ -1138,6 +1190,37 @@ impl RendezvousServer {
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
+            }
+
+            if let Some(guest_relay) = guest_relay {
+                let now = Instant::now();
+                let mut pending = self.guest_relays.lock().await;
+                pending.retain(|_, guest| guest.expires_at > now);
+                if pending.len() >= 32 {
+                    let mut response = RendezvousMessage::new();
+                    response.set_punch_hole_response(PunchHoleResponse {
+                        other_failure: "Guest relay is busy".to_owned(),
+                        ..Default::default()
+                    });
+                    return Ok((response, None));
+                }
+                let uuid = uuid::Uuid::new_v4().to_string();
+                pending.insert(try_into_v4(addr), GuestRelay {
+                    peer_id: id,
+                    peer_ip: try_into_v4(peer_addr).ip(),
+                    uuid: uuid.clone(),
+                    expires_at: now + Duration::from_secs(15),
+                });
+                let mut request = RendezvousMessage::new();
+                request.set_request_relay(RequestRelay {
+                    uuid,
+                    socket_addr: AddrMangle::encode(addr).into(),
+                    relay_server: guest_relay,
+                    secure: true,
+                    control_permissions: control_permissions(permissions),
+                    ..Default::default()
+                });
+                return Ok((request, Some(peer_addr)));
             }
 
             // record punch hole request (from addr -> peer id/peer_addr)
@@ -1264,8 +1347,9 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        local_websocket: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws, local_websocket).await?;
         if let Some(addr) = to_addr {
             let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
             if let Some(s) = sink.as_mut() {
@@ -1286,7 +1370,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false, false).await?;
         self.tx.send(Data::Msg(
             msg.into(),
             match to_addr {
@@ -1643,6 +1727,7 @@ impl RendezvousServer {
         let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            let local_websocket = try_into_v4(addr).ip().is_loopback();
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
                 // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
@@ -1682,7 +1767,7 @@ impl RendezvousServer {
             }));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, local_websocket).await {
                         break;
                     }
                 }
@@ -1709,7 +1794,7 @@ impl RendezvousServer {
                         }
                     }
                 }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, false).await {
                     break;
                 }
             }

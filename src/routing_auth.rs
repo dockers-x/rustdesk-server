@@ -158,6 +158,48 @@ pub(crate) async fn device_admission(id: &str, uuid: &[u8], pk: &[u8], observe: 
     }
 }
 
+pub(crate) fn has_guest_proof(token: &str) -> bool {
+    token.starts_with("rdg1.")
+}
+
+#[derive(Deserialize)]
+struct GuestSignalClaims {
+    sub: String,
+    exp: i64,
+}
+
+pub(crate) fn guest_relay(request: &PunchHoleRequest, local_websocket: bool) -> Option<String> {
+    if !local_websocket || !request.force_relay || !verify_guest_proof(&request.token, &request.id, &ADMISSION_TOKEN) {
+        return None;
+    }
+    std::env::var("RUSTDESK_GUEST_RELAY_ADDRESS")
+        .ok()
+        .filter(|address| !address.trim().is_empty() && address.len() <= 512)
+}
+
+fn verify_guest_proof(proof: &str, peer_id: &str, secret: &str) -> bool {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use sha2::{Digest, Sha256};
+
+    let Some(token) = proof.strip_prefix("rdg1.").filter(|token| token.len() <= 1024) else {
+        return false;
+    };
+    if secret.len() < 32 {
+        return false;
+    }
+    let derived = Sha256::new()
+        .chain_update(b"rustdesk-guest-signal-v1\0")
+        .chain_update(secret.as_bytes())
+        .finalize();
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_audience(&["rustdesk-guest-v1"]);
+    validation.set_required_spec_claims(&["exp", "aud", "sub"]);
+    validation.leeway = 0;
+    let now = chrono::Utc::now().timestamp();
+    decode::<GuestSignalClaims>(token, &DecodingKey::from_secret(&derived), &validation)
+        .is_ok_and(|data| data.claims.sub == peer_id && data.claims.exp > now && data.claims.exp <= now + 20)
+}
+
 pub(crate) fn punch_denial(
     request: &PunchHoleRequest,
     key: &str,
@@ -226,6 +268,32 @@ mod tests {
             &EncodingKey::from_secret(secret.as_bytes()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn guest_proofs_are_short_lived_and_bound_to_the_expected_target_and_audience() {
+        use sha2::{Digest, Sha256};
+
+        let secret = "enrollment-and-guest-channel-secret";
+        let derived = Sha256::new()
+            .chain_update(b"rustdesk-guest-signal-v1\0")
+            .chain_update(secret.as_bytes())
+            .finalize();
+        let make = |aud, expire| {
+            let token = encode(
+                &Header::default(),
+                &serde_json::json!({ "aud": aud, "sub": "target", "exp": chrono::Utc::now().timestamp() + expire }),
+                &EncodingKey::from_secret(&derived),
+            ).unwrap();
+            format!("rdg1.{token}")
+        };
+        let valid = make("rustdesk-guest-v1", 15);
+        assert!(verify_guest_proof(&valid, "target", secret));
+        assert!(!verify_guest_proof(&valid, "another", secret));
+        assert!(!verify_guest_proof(&valid, "target", "another-secret-that-is-long-enough"));
+        assert!(!verify_guest_proof(&make("legacy", 15), "target", secret));
+        assert!(!verify_guest_proof(&make("rustdesk-guest-v1", -1), "target", secret));
+        assert!(!verify_guest_proof(&make("rustdesk-guest-v1", 60), "target", secret));
     }
 
     #[test]
